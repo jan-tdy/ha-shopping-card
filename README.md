@@ -8,12 +8,20 @@ by category, track prices, and see your progress — all from the card.
 
 - **Check off / add / rename / delete** items inline, no dialogs.
 - **Categories** — group items by category, collapse/expand each group, per-category subtotal.
+  Define your own ordered category list in the config, or just let it pick up whatever
+  categories you use on items.
 - **Prices** — per-item price, running total of everything still to buy.
-- **Sorting** — manual (backend order), alphabetical, or by price.
+- **Notes** — an optional note/description per item (e.g. "get the ripe ones").
+- **Drag to reorder** — manual sort supports dragging items into the order you actually
+  shop in (e.g. by store aisle).
+- **Sorting** — manual (drag-orderable), alphabetical, or by price.
 - **Progress bar** — completed vs. total items.
 - **Search** — filter the list as you type.
 - **Clear completed** — one click to remove everything checked off.
 - **Visual editor** — configure entirely through the GUI card editor, no YAML needed.
+
+Notes and drag-reordering only appear when the underlying `todo` entity supports them
+(most integrations, including the built-in shopping list, do).
 
 ## Installation
 
@@ -44,6 +52,10 @@ title: Shopping List
 currency: "€"
 sort: manual # manual | alpha | price
 group_by_category: true
+categories:
+  - Dairy
+  - Produce
+  - Bakery
 show_categories: true
 show_prices: true
 show_completed: true
@@ -57,8 +69,9 @@ show_add: true
 | `entity`              | *(required)*        | A `todo.*` entity, e.g. your shopping list.        |
 | `title`               | `Shopping List`      | Card title.                                        |
 | `currency`            | `€`                 | Symbol appended to prices.                         |
-| `sort`                | `manual`             | `manual`, `alpha`, or `price`.                     |
+| `sort`                | `manual`             | `manual`, `alpha`, or `price`. Only `manual` supports drag-to-reorder. |
 | `group_by_category`   | `true`               | Group items under category headers.                |
+| `categories`          | `[]`                 | Predefined, ordered list of categories. Fixes group order and seeds suggestions; other categories used on items still show up, sorted alphabetically after these. |
 | `show_categories`     | `true`               | Show the category chip on each item.               |
 | `show_prices`         | `true`               | Show prices and totals.                            |
 | `show_completed`      | `true`               | Show items already checked off.                    |
@@ -86,9 +99,21 @@ category/price fields in the quick-add and edit forms — the card builds and pa
 for you, and the item still reads fine as plain text anywhere else (mobile app, voice
 assistant, etc.).
 
+### Notes and reordering
+
+Unlike category/price, an item's note uses the `todo` entity's own `description` field, and
+reordering uses its own move support — both are only shown if the entity reports it supports
+them (`supported_features`). The built-in Home Assistant shopping list supports both.
+
+To reorder, switch sort to **Manual** and drag an item by its handle. When grouped by
+category, you can only reorder within the same category group; turn grouping off for free
+reordering across the whole list.
+
 ## Requirements
 
 - Home Assistant 2023.11 or newer (for the `todo` entity platform).
+- For notes and drag-to-reorder: a `todo` entity that supports description/move (the built-in
+  shopping list does).
 
 ## License
 
