@@ -6,9 +6,16 @@
  * https://github.com/jan-tdy/ha-shopping-card
  */
 
-const CARD_VERSION = "0.1.0";
+const CARD_VERSION = "0.2.0";
 const CARD_TAG = "shopping-card";
 const EDITOR_TAG = "shopping-card-editor";
+
+// Bit flags from Home Assistant's TodoListEntityFeature enum, used to only
+// show/allow actions the specific todo entity actually supports.
+const TODO_FEATURES = {
+  MOVE: 8,
+  SET_DESCRIPTION: 64,
+};
 
 // eslint-disable-next-line no-console
 console.info(
@@ -122,6 +129,7 @@ class ShoppingCard extends HTMLElement {
       show_search: true,
       show_add: true,
       sort: "manual",
+      categories: [],
       ...config,
     };
     this._loadPrefs();
@@ -215,6 +223,22 @@ class ShoppingCard extends HTMLElement {
     }
   }
 
+  // ---------- capabilities ----------
+
+  _supportsFeature(bit) {
+    const stateObj = this._hass?.states[this._config?.entity];
+    const supported = stateObj?.attributes?.supported_features || 0;
+    return (supported & bit) === bit;
+  }
+
+  _dragEnabled() {
+    return (
+      this._config.sort === "manual" &&
+      !this._searchOpen &&
+      this._supportsFeature(TODO_FEATURES.MOVE)
+    );
+  }
+
   // ---------- data ----------
 
   async _fetchItems() {
@@ -240,24 +264,53 @@ class ShoppingCard extends HTMLElement {
     });
   }
 
-  async _addItem(name, category, price) {
+  async _addItem(name, category, price, description) {
     const text = buildItemText(name, category, price, this._config.currency);
     if (!text) return;
+    const data = { item: text };
+    if (description && this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
+      data.description = description;
+    }
     try {
-      await this._callService("add_item", { item: text });
+      await this._callService("add_item", data);
     } catch (e) {
       console.error("shopping-card: add_item failed", e);
     }
   }
 
-  async _renameItem(uid, name, category, price) {
+  async _renameItem(uid, name, category, price, description) {
     const text = buildItemText(name, category, price, this._config.currency);
     if (!text) return;
+    const data = { item: uid, rename: text };
+    if (this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
+      data.description = description || "";
+    }
     try {
-      await this._callService("update_item", { item: uid, rename: text });
+      await this._callService("update_item", data);
     } catch (e) {
       console.error("shopping-card: update_item failed", e);
     }
+  }
+
+  _rawPreviousUid(targetUid) {
+    const idx = this._items.findIndex((it) => it.uid === targetUid);
+    if (idx <= 0) return null;
+    return this._items[idx - 1].uid;
+  }
+
+  async _moveItem(uid, previousUid) {
+    if (uid === previousUid) return;
+    try {
+      await this._hass.callWS({
+        type: "todo/item/move",
+        entity_id: this._config.entity,
+        uid,
+        previous_uid: previousUid ?? undefined,
+      });
+    } catch (e) {
+      console.error("shopping-card: move failed", e);
+    }
+    this._fetchItems();
   }
 
   async _setStatus(uid, completed) {
@@ -299,7 +352,7 @@ class ShoppingCard extends HTMLElement {
   _processedItems() {
     let items = this._items.map((it) => {
       const parsed = parseItemText(it.summary);
-      return { ...it, ...parsed, completed: it.status === "completed" };
+      return { ...it, ...parsed, description: it.description || "", completed: it.status === "completed" };
     });
 
     if (this._filterText) {
@@ -307,7 +360,8 @@ class ShoppingCard extends HTMLElement {
       items = items.filter(
         (it) =>
           it.name.toLowerCase().includes(f) ||
-          (it.category || "").toLowerCase().includes(f)
+          (it.category || "").toLowerCase().includes(f) ||
+          it.description.toLowerCase().includes(f)
       );
     }
 
@@ -318,13 +372,17 @@ class ShoppingCard extends HTMLElement {
     return items;
   }
 
+  // Predefined categories (from config) come first, in the given order,
+  // followed by any other categories already used on items, alphabetically.
   _categories() {
-    const set = new Set();
+    const predefined = (this._config.categories || []).filter(Boolean);
+    const used = new Set();
     this._items.forEach((it) => {
       const { category } = parseItemText(it.summary);
-      if (category) set.add(category);
+      if (category) used.add(category);
     });
-    return [...set].sort((a, b) => a.localeCompare(b));
+    predefined.forEach((c) => used.delete(c));
+    return [...predefined, ...[...used].sort((a, b) => a.localeCompare(b))];
   }
 
   _sortItems(items) {
@@ -354,6 +412,7 @@ class ShoppingCard extends HTMLElement {
       map.get(key).push(it);
     }
     const collator = new Intl.Collator(this._hass?.language || "en");
+    const predefined = this._config.categories || [];
     const groups = [...map.entries()].map(([category, its]) => ({
       category,
       items: this._sortItems(its),
@@ -361,6 +420,11 @@ class ShoppingCard extends HTMLElement {
     groups.sort((a, b) => {
       if (a.category === null) return 1;
       if (b.category === null) return -1;
+      const aIdx = predefined.indexOf(a.category);
+      const bIdx = predefined.indexOf(b.category);
+      if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+      if (aIdx !== -1) return -1;
+      if (bIdx !== -1) return 1;
       return collator.compare(a.category, b.category);
     });
     return groups;
@@ -506,19 +570,35 @@ class ShoppingCard extends HTMLElement {
       return this._renderEditRow(item);
     }
     const color = categoryColor(item.category);
-    return `<div class="item ${item.completed ? "completed" : ""}" data-uid="${escapeHtml(item.uid)}">
+    const draggable = this._dragEnabled();
+    return `<div
+      class="item ${item.completed ? "completed" : ""}"
+      data-uid="${escapeHtml(item.uid)}"
+      data-category="${escapeHtml(item.category || "")}"
+      ${draggable ? 'draggable="true"' : ""}
+    >
+      ${
+        draggable
+          ? `<span class="drag-handle" title="Drag to reorder"><ha-icon icon="mdi:drag-vertical"></ha-icon></span>`
+          : ""
+      }
       <input type="checkbox" class="checkbox" data-action="toggle-item" data-uid="${escapeHtml(item.uid)}" ${item.completed ? "checked" : ""} />
-      <span class="item-name">${escapeHtml(item.name) || "(no name)"}</span>
-      ${
-        this._config.show_categories && item.category
-          ? `<span class="chip" style="background:${color.bg};color:${color.fg}">${escapeHtml(item.category)}</span>`
-          : ""
-      }
-      ${
-        this._config.show_prices && item.price !== null
-          ? `<span class="price">${escapeHtml(formatPrice(item.price, this._config.currency))}</span>`
-          : ""
-      }
+      <div class="item-body">
+        <div class="item-main-row">
+          <span class="item-name">${escapeHtml(item.name) || "(no name)"}</span>
+          ${
+            this._config.show_categories && item.category
+              ? `<span class="chip" style="background:${color.bg};color:${color.fg}">${escapeHtml(item.category)}</span>`
+              : ""
+          }
+          ${
+            this._config.show_prices && item.price !== null
+              ? `<span class="price">${escapeHtml(formatPrice(item.price, this._config.currency))}</span>`
+              : ""
+          }
+        </div>
+        ${item.description ? `<div class="item-desc">${escapeHtml(item.description)}</div>` : ""}
+      </div>
       <button class="icon-btn small" data-action="edit-item" data-uid="${escapeHtml(item.uid)}" title="Edit">
         <ha-icon icon="mdi:pencil"></ha-icon>
       </button>
@@ -529,29 +609,45 @@ class ShoppingCard extends HTMLElement {
   }
 
   _renderEditRow(item) {
+    const descriptionSupported = this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION);
     return `<div class="item editing" data-uid="${escapeHtml(item.uid)}">
       <form class="edit-form" data-form="edit" data-uid="${escapeHtml(item.uid)}">
-        <input type="text" name="name" class="edit-name" value="${escapeHtml(item.name)}" placeholder="Name" autofocus />
-        <input type="text" name="category" class="edit-category" value="${escapeHtml(item.category || "")}" placeholder="Category" />
-        <input type="number" name="price" class="edit-price" step="0.01" min="0" value="${item.price !== null ? item.price : ""}" placeholder="Price" />
-        <button type="submit" class="icon-btn small primary" title="Save"><ha-icon icon="mdi:check"></ha-icon></button>
-        <button type="button" class="icon-btn small" data-action="cancel-edit" title="Cancel"><ha-icon icon="mdi:close"></ha-icon></button>
+        <div class="edit-row">
+          <input type="text" name="name" class="edit-name" value="${escapeHtml(item.name)}" placeholder="Name" autofocus />
+          <input type="text" name="category" class="edit-category" value="${escapeHtml(item.category || "")}" placeholder="Category" list="sc-categories" />
+          <input type="number" name="price" class="edit-price" step="0.01" min="0" value="${item.price !== null ? item.price : ""}" placeholder="Price" />
+          <button type="submit" class="icon-btn small primary" title="Save"><ha-icon icon="mdi:check"></ha-icon></button>
+          <button type="button" class="icon-btn small" data-action="cancel-edit" title="Cancel"><ha-icon icon="mdi:close"></ha-icon></button>
+        </div>
+        ${
+          descriptionSupported
+            ? `<textarea name="description" class="edit-description" placeholder="Note…" rows="2">${escapeHtml(item.description)}</textarea>`
+            : ""
+        }
       </form>
     </div>`;
   }
 
   _renderAddForm(categories) {
+    const descriptionSupported = this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION);
     return `<form class="add-form" data-form="add">
-      <input type="text" name="name" class="add-name" placeholder="Add item…" autocomplete="off" required />
-      <button type="button" class="icon-btn ${this._addExtraOpen ? "active" : ""}" data-action="toggle-add-extra" title="More options">
-        <ha-icon icon="mdi:tune-variant"></ha-icon>
-      </button>
-      <button type="submit" class="icon-btn primary" title="Add">
-        <ha-icon icon="mdi:plus"></ha-icon>
-      </button>
+      <div class="add-row">
+        <input type="text" name="name" class="add-name" placeholder="Add item…" autocomplete="off" required />
+        <button type="button" class="icon-btn ${this._addExtraOpen ? "active" : ""}" data-action="toggle-add-extra" title="More options">
+          <ha-icon icon="mdi:tune-variant"></ha-icon>
+        </button>
+        <button type="submit" class="icon-btn primary" title="Add">
+          <ha-icon icon="mdi:plus"></ha-icon>
+        </button>
+      </div>
       <div class="add-extra" ${this._addExtraOpen ? "" : "hidden"}>
         <input type="text" name="category" class="add-category" placeholder="Category" list="sc-categories" />
         <input type="number" name="price" class="add-price" step="0.01" min="0" placeholder="Price" />
+        ${
+          descriptionSupported
+            ? `<input type="text" name="description" class="add-description" placeholder="Note" />`
+            : ""
+        }
       </div>
       <datalist id="sc-categories">
         ${categories.map((c) => `<option value="${escapeHtml(c)}"></option>`).join("")}
@@ -587,7 +683,8 @@ class ShoppingCard extends HTMLElement {
       .icon-btn.small { width: 30px; height: 30px; }
       .icon-btn:hover { background: rgba(var(--rgb-primary-text-color, 0,0,0), 0.06); }
       .icon-btn.active, .icon-btn.primary { color: var(--primary-color); }
-      .search-input, .edit-name, .edit-category, .edit-price, .add-name, .add-category, .add-price {
+      .search-input, .edit-name, .edit-category, .edit-price, .edit-description,
+      .add-name, .add-category, .add-price, .add-description {
         background: var(--card-background-color);
         color: var(--primary-text-color);
         border: 1px solid var(--divider-color);
@@ -612,19 +709,37 @@ class ShoppingCard extends HTMLElement {
       .group-count { font-size: 0.8em; opacity: 0.7; }
       .group-subtotal { margin-left: auto; font-size: 0.85em; font-weight: 600; color: var(--primary-text-color); }
       .item {
-        display: flex; align-items: center; gap: 8px;
+        display: flex; align-items: center; gap: 4px;
         padding: 6px 8px; border-radius: 8px;
+        border-top: 2px solid transparent; border-bottom: 2px solid transparent;
       }
       .item:hover { background: rgba(var(--rgb-primary-text-color, 0,0,0), 0.04); }
       .item.completed .item-name { text-decoration: line-through; color: var(--secondary-text-color); }
+      .item.dragging { opacity: 0.4; }
+      .item.drag-over-top { border-top-color: var(--primary-color); }
+      .item.drag-over-bottom { border-bottom-color: var(--primary-color); }
+      .item.no-drop { cursor: no-drop; }
+      .drag-handle {
+        display: flex; align-items: center; color: var(--secondary-text-color);
+        cursor: grab; flex-shrink: 0; opacity: 0.6;
+      }
+      .drag-handle ha-icon { --mdc-icon-size: 18px; }
       .checkbox { width: 20px; height: 20px; flex-shrink: 0; accent-color: var(--primary-color); cursor: pointer; }
+      .item-body { flex: 1; min-width: 0; }
+      .item-main-row { display: flex; align-items: center; gap: 8px; }
       .item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--primary-text-color); }
+      .item-desc {
+        font-size: 0.8em; color: var(--secondary-text-color);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
       .chip { font-size: 0.75em; font-weight: 600; padding: 2px 8px; border-radius: 10px; flex-shrink: 0; }
       .price { font-size: 0.85em; font-weight: 600; color: var(--primary-text-color); flex-shrink: 0; }
-      .edit-form { display: flex; align-items: center; gap: 6px; width: 100%; flex-wrap: wrap; }
+      .edit-form { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+      .edit-row { display: flex; align-items: center; gap: 6px; width: 100%; flex-wrap: wrap; }
       .edit-name { flex: 2; min-width: 100px; }
       .edit-category { flex: 1; min-width: 80px; }
       .edit-price { width: 80px; }
+      .edit-description { width: 100%; box-sizing: border-box; resize: vertical; }
       .footer { padding: 4px 8px 8px; display: flex; justify-content: flex-end; }
       .text-btn {
         display: inline-flex; align-items: center; gap: 4px;
@@ -632,12 +747,14 @@ class ShoppingCard extends HTMLElement {
         color: var(--secondary-text-color); font-size: 0.85em; padding: 6px 8px; border-radius: 8px;
       }
       .text-btn:hover { background: rgba(var(--rgb-primary-text-color, 0,0,0), 0.06); }
-      .add-form { display: flex; align-items: center; gap: 4px; padding: 8px 16px 16px; flex-wrap: wrap; border-top: 1px solid var(--divider-color); margin-top: 4px; padding-top: 12px; }
+      .add-form { display: flex; flex-direction: column; gap: 6px; padding: 8px 16px 16px; border-top: 1px solid var(--divider-color); margin-top: 4px; padding-top: 12px; }
+      .add-row { display: flex; align-items: center; gap: 4px; }
       .add-name { flex: 1; min-width: 100px; }
-      .add-extra { display: flex; gap: 6px; width: 100%; }
+      .add-extra { display: flex; gap: 6px; width: 100%; flex-wrap: wrap; }
       .add-extra[hidden] { display: none; }
-      .add-category { flex: 1; }
+      .add-category { flex: 1; min-width: 80px; }
       .add-price { width: 90px; }
+      .add-description { flex: 2; min-width: 120px; }
       code { background: rgba(var(--rgb-primary-text-color, 0,0,0), 0.06); padding: 1px 4px; border-radius: 4px; }
     </style>`;
   }
@@ -728,7 +845,8 @@ class ShoppingCard extends HTMLElement {
         if (!name) return;
         const category = (data.get("category") || "").toString().trim();
         const price = (data.get("price") || "").toString().trim();
-        this._addItem(name, category, price === "" ? null : price);
+        const description = (data.get("description") || "").toString().trim();
+        this._addItem(name, category, price === "" ? null : price, description);
         form.reset();
         const extra = form.querySelector(".add-extra");
         if (extra) extra.hidden = true;
@@ -739,8 +857,9 @@ class ShoppingCard extends HTMLElement {
         const name = (data.get("name") || "").toString().trim();
         const category = (data.get("category") || "").toString().trim();
         const price = (data.get("price") || "").toString().trim();
+        const description = (data.get("description") || "").toString().trim();
         this._editingUid = null;
-        this._renameItem(uid, name, category, price === "" ? null : price);
+        this._renameItem(uid, name, category, price === "" ? null : price, description);
       }
     });
 
@@ -749,6 +868,59 @@ class ShoppingCard extends HTMLElement {
         this._editingUid = null;
         this._render();
       }
+    });
+
+    // Drag-and-drop manual reordering (only active in "manual" sort mode).
+    root.addEventListener("dragstart", (ev) => {
+      const row = ev.target.closest(".item[draggable='true']");
+      if (!row) return;
+      this._dragUid = row.dataset.uid;
+      this._dragCategory = row.dataset.category || "";
+      ev.dataTransfer.effectAllowed = "move";
+      ev.dataTransfer.setData("text/plain", row.dataset.uid);
+      row.classList.add("dragging");
+    });
+
+    root.addEventListener("dragover", (ev) => {
+      const row = ev.target.closest(".item[data-uid]");
+      if (!row || !this._dragUid || row.dataset.uid === this._dragUid) return;
+      if (this._config.group_by_category && row.dataset.category !== this._dragCategory) {
+        row.classList.add("no-drop");
+        return;
+      }
+      ev.preventDefault();
+      row.classList.remove("no-drop");
+      const rect = row.getBoundingClientRect();
+      const before = ev.clientY - rect.top < rect.height / 2;
+      row.classList.toggle("drag-over-top", before);
+      row.classList.toggle("drag-over-bottom", !before);
+    });
+
+    root.addEventListener("dragleave", (ev) => {
+      const row = ev.target.closest(".item[data-uid]");
+      if (row) row.classList.remove("drag-over-top", "drag-over-bottom", "no-drop");
+    });
+
+    root.addEventListener("drop", (ev) => {
+      const row = ev.target.closest(".item[data-uid]");
+      if (!row || !this._dragUid) return;
+      ev.preventDefault();
+      const targetUid = row.dataset.uid;
+      const draggedUid = this._dragUid;
+      const before = row.classList.contains("drag-over-top");
+      row.classList.remove("drag-over-top", "drag-over-bottom", "no-drop");
+      if (targetUid === draggedUid) return;
+      if (this._config.group_by_category && row.dataset.category !== this._dragCategory) return;
+      const previousUid = before ? this._rawPreviousUid(targetUid) : targetUid;
+      this._moveItem(draggedUid, previousUid);
+    });
+
+    root.addEventListener("dragend", () => {
+      this._dragUid = null;
+      this._dragCategory = null;
+      root.querySelectorAll(".item").forEach((row) => {
+        row.classList.remove("dragging", "drag-over-top", "drag-over-bottom", "no-drop");
+      });
     });
   }
 
@@ -760,7 +932,8 @@ class ShoppingCard extends HTMLElement {
     root.querySelectorAll(".items .item[data-uid]").forEach((row) => {
       const name = row.querySelector(".item-name")?.textContent?.toLowerCase() || "";
       const chip = row.querySelector(".chip")?.textContent?.toLowerCase() || "";
-      row.style.display = !f || name.includes(f) || chip.includes(f) ? "" : "none";
+      const desc = row.querySelector(".item-desc")?.textContent?.toLowerCase() || "";
+      row.style.display = !f || name.includes(f) || chip.includes(f) || desc.includes(f) ? "" : "none";
     });
     root.querySelectorAll(".group").forEach((group) => {
       const visible = [...group.querySelectorAll(".item[data-uid]")].some(
@@ -794,6 +967,7 @@ class ShoppingCardEditor extends HTMLElement {
         },
       },
       { name: "group_by_category", selector: { boolean: {} } },
+      { name: "categories", selector: { text: { multiple: true } } },
       { name: "show_categories", selector: { boolean: {} } },
       { name: "show_prices", selector: { boolean: {} } },
       { name: "show_completed", selector: { boolean: {} } },
@@ -810,6 +984,7 @@ class ShoppingCardEditor extends HTMLElement {
       currency: "Currency symbol",
       sort: "Sort items by",
       group_by_category: "Group by category",
+      categories: "Categories (defines order, and suggestions)",
       show_categories: "Show category chips",
       show_prices: "Show prices",
       show_completed: "Show completed items",
@@ -847,7 +1022,7 @@ window.customCards.push({
   type: CARD_TAG,
   name: "Shopping List Card",
   description:
-    "Editable shopping list card backed by a Home Assistant todo entity, with categories, prices, sorting and quick add/edit.",
+    "Editable shopping list card backed by a Home Assistant todo entity, with categories, prices, notes, drag-to-reorder and quick add/edit.",
   preview: true,
   documentationURL: "https://github.com/jan-tdy/ha-shopping-card",
 });
