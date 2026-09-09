@@ -6,7 +6,7 @@
  * https://github.com/jan-tdy/ha-shopping-card
  */
 
-const CARD_VERSION = "0.2.0";
+const CARD_VERSION = "0.3.0";
 const CARD_TAG = "shopping-card";
 const EDITOR_TAG = "shopping-card-editor";
 
@@ -32,6 +32,57 @@ const SORT_OPTIONS = [
 
 const CURRENCY_TOKEN = "[€$£¥]|Kč|CZK|EUR|USD";
 
+// Small starter dictionary mapping common grocery item names to a category,
+// used as a fallback suggestion before anything has been learned yet.
+// Keys are lowercased; English and Slovak names are both included.
+const CATEGORY_DICTIONARY = {
+  milk: "Dairy", mlieko: "Dairy",
+  cheese: "Dairy", syr: "Dairy",
+  yogurt: "Dairy", jogurt: "Dairy",
+  butter: "Dairy", maslo: "Dairy",
+  cream: "Dairy", smotana: "Dairy",
+  eggs: "Dairy", vajcia: "Dairy",
+  apple: "Produce", apples: "Produce", jablko: "Produce", jablka: "Produce",
+  banana: "Produce", bananas: "Produce", banan: "Produce", banány: "Produce",
+  tomato: "Produce", tomatoes: "Produce", paradajka: "Produce", paradajky: "Produce",
+  potato: "Produce", potatoes: "Produce", zemiak: "Produce", zemiaky: "Produce",
+  onion: "Produce", onions: "Produce", cibula: "Produce",
+  carrot: "Produce", carrots: "Produce", mrkva: "Produce",
+  lettuce: "Produce", šalát: "Produce",
+  cucumber: "Produce", uhorka: "Produce",
+  bread: "Bakery", chlieb: "Bakery",
+  baguette: "Bakery", bageta: "Bakery",
+  croissant: "Bakery", rolls: "Bakery", rožky: "Bakery",
+  chicken: "Meat", kurča: "Meat", kuracie: "Meat",
+  beef: "Meat", hovädzie: "Meat",
+  pork: "Meat", bravčové: "Meat",
+  sausage: "Meat", klobása: "Meat",
+  bacon: "Meat", slanina: "Meat",
+  ham: "Meat", šunka: "Meat",
+  fish: "Seafood", ryba: "Seafood",
+  salmon: "Seafood", losos: "Seafood",
+  shrimp: "Seafood",
+  tuna: "Seafood", tuniak: "Seafood",
+  rice: "Pantry", ryža: "Pantry",
+  pasta: "Pantry", cestoviny: "Pantry",
+  flour: "Pantry", múka: "Pantry",
+  sugar: "Pantry", cukor: "Pantry",
+  salt: "Pantry", soľ: "Pantry",
+  oil: "Pantry", olej: "Pantry",
+  coffee: "Beverages", káva: "Beverages",
+  tea: "Beverages", čaj: "Beverages",
+  juice: "Beverages", džús: "Beverages",
+  water: "Beverages", voda: "Beverages",
+  wine: "Beverages", víno: "Beverages",
+  beer: "Beverages", pivo: "Beverages",
+  soap: "Household", mydlo: "Household",
+  detergent: "Household",
+  "toilet paper": "Household", "toaletný papier": "Household",
+  "paper towels": "Household",
+  shampoo: "Personal Care", šampón: "Personal Care",
+  toothpaste: "Personal Care", "zubná pasta": "Personal Care",
+};
+
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;",
@@ -53,20 +104,29 @@ function categoryColor(name) {
 }
 
 /**
- * Category and price are not native `todo` item fields, so they are encoded
- * inline in the item's summary text using simple tags:
- *   "Milk #Dairy 1.50€"
+ * Category, price and quantity are not native `todo` item fields, so they
+ * are encoded inline in the item's summary text using simple tags:
+ *   "Milk x2 #Dairy 1.50€"
  * This keeps items fully readable/editable from any other todo UI too.
  */
 function parseItemText(rawSummary) {
   let name = rawSummary || "";
   let category = null;
   let price = null;
+  let qty = 1;
 
   const catMatch = name.match(/#([^\s#]+)/);
   if (catMatch) {
     category = catMatch[1].replace(/_/g, " ");
     name = name.slice(0, catMatch.index) + name.slice(catMatch.index + catMatch[0].length);
+  }
+
+  // Quantity: "2x Milk" or "Milk x2" (word-bounded, so "2x2 tile" is left alone).
+  const qtyMatch = name.match(/\b(\d+)\s*[x×]\b|\b[x×]\s*(\d+)\b/i);
+  if (qtyMatch) {
+    const n = parseInt(qtyMatch[1] ?? qtyMatch[2], 10);
+    if (!Number.isNaN(n) && n > 0) qty = n;
+    name = name.slice(0, qtyMatch.index) + name.slice(qtyMatch.index + qtyMatch[0].length);
   }
 
   const priceRegex = new RegExp(
@@ -82,11 +142,13 @@ function parseItemText(rawSummary) {
   }
 
   name = name.replace(/\s{2,}/g, " ").trim();
-  return { name, category, price };
+  return { name, category, price, qty };
 }
 
-function buildItemText(name, category, price, currency) {
+function buildItemText(name, category, price, currency, qty) {
   let text = (name || "").trim();
+  const q = Math.max(1, Math.floor(Number(qty)) || 1);
+  if (q > 1) text += ` x${q}`;
   if (price !== null && price !== undefined && price !== "") {
     const num = Number(price);
     if (!Number.isNaN(num)) text += ` ${num.toFixed(2)}${currency || "€"}`;
@@ -111,6 +173,8 @@ class ShoppingCard extends HTMLElement {
     this._filterText = "";
     this._searchOpen = false;
     this._addExtraOpen = false;
+    this._addCategoryTouched = false;
+    this._shoppingMode = false;
     this._listenersBound = false;
   }
 
@@ -130,9 +194,15 @@ class ShoppingCard extends HTMLElement {
       show_add: true,
       sort: "manual",
       categories: [],
+      show_shopping_mode_button: true,
+      nav_button_label: "",
+      nav_button_icon: "mdi:fridge-outline",
+      nav_button_path: "",
       ...config,
     };
     this._loadPrefs();
+    this._loadLearned();
+    this._loadPriceHistory();
     this._render();
     if (this._hass) this._fetchItems();
   }
@@ -202,6 +272,7 @@ class ShoppingCard extends HTMLElement {
           this._config.group_by_category = prefs.group_by_category;
         }
         if (Array.isArray(prefs.collapsed)) this._collapsed = new Set(prefs.collapsed);
+        if (typeof prefs.shopping_mode === "boolean") this._shoppingMode = prefs.shopping_mode;
       }
     } catch (e) {
       // ignore malformed/unavailable storage
@@ -216,11 +287,83 @@ class ShoppingCard extends HTMLElement {
           sort: this._config.sort,
           group_by_category: this._config.group_by_category,
           collapsed: [...this._collapsed],
+          shopping_mode: this._shoppingMode,
         })
       );
     } catch (e) {
       // ignore malformed/unavailable storage
     }
+  }
+
+  // ---------- category learning & price history (per-entity, local) ----------
+
+  _loadLearned() {
+    this._learned = {};
+    try {
+      const raw = localStorage.getItem(`shopping-card-learned-${this._config.entity}`);
+      if (raw) this._learned = JSON.parse(raw);
+    } catch (e) {
+      // ignore malformed/unavailable storage
+    }
+  }
+
+  _saveLearned() {
+    try {
+      localStorage.setItem(`shopping-card-learned-${this._config.entity}`, JSON.stringify(this._learned));
+    } catch (e) {
+      // ignore malformed/unavailable storage
+    }
+  }
+
+  _learnCategory(name, category) {
+    if (!name || !category) return;
+    const key = name.trim().toLowerCase();
+    if (!key || this._learned[key] === category) return;
+    this._learned[key] = category;
+    this._saveLearned();
+  }
+
+  _suggestCategory(name) {
+    const key = (name || "").trim().toLowerCase();
+    if (!key) return "";
+    return this._learned[key] || CATEGORY_DICTIONARY[key] || "";
+  }
+
+  _loadPriceHistory() {
+    this._priceHistory = {};
+    try {
+      const raw = localStorage.getItem(`shopping-card-price-history-${this._config.entity}`);
+      if (raw) this._priceHistory = JSON.parse(raw);
+    } catch (e) {
+      // ignore malformed/unavailable storage
+    }
+  }
+
+  _savePriceHistory() {
+    try {
+      localStorage.setItem(
+        `shopping-card-price-history-${this._config.entity}`,
+        JSON.stringify(this._priceHistory)
+      );
+    } catch (e) {
+      // ignore malformed/unavailable storage
+    }
+  }
+
+  _learnPrice(name, price) {
+    if (!name || price === null || price === undefined || price === "") return;
+    const num = Number(price);
+    if (Number.isNaN(num)) return;
+    const key = name.trim().toLowerCase();
+    if (!key) return;
+    this._priceHistory[key] = num;
+    this._savePriceHistory();
+  }
+
+  _suggestPrice(name) {
+    const key = (name || "").trim().toLowerCase();
+    if (!key) return null;
+    return this._priceHistory[key] ?? null;
   }
 
   // ---------- capabilities ----------
@@ -235,6 +378,7 @@ class ShoppingCard extends HTMLElement {
     return (
       this._config.sort === "manual" &&
       !this._searchOpen &&
+      !this._shoppingMode &&
       this._supportsFeature(TODO_FEATURES.MOVE)
     );
   }
@@ -264,13 +408,15 @@ class ShoppingCard extends HTMLElement {
     });
   }
 
-  async _addItem(name, category, price, description) {
-    const text = buildItemText(name, category, price, this._config.currency);
+  async _addItem(name, category, price, description, qty) {
+    const text = buildItemText(name, category, price, this._config.currency, qty);
     if (!text) return;
     const data = { item: text };
     if (description && this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
       data.description = description;
     }
+    this._learnCategory(name, category);
+    this._learnPrice(name, price);
     try {
       await this._callService("add_item", data);
     } catch (e) {
@@ -278,13 +424,15 @@ class ShoppingCard extends HTMLElement {
     }
   }
 
-  async _renameItem(uid, name, category, price, description) {
-    const text = buildItemText(name, category, price, this._config.currency);
+  async _renameItem(uid, name, category, price, description, qty) {
+    const text = buildItemText(name, category, price, this._config.currency, qty);
     if (!text) return;
     const data = { item: uid, rename: text };
     if (this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
       data.description = description || "";
     }
+    this._learnCategory(name, category);
+    this._learnPrice(name, price);
     try {
       await this._callService("update_item", data);
     } catch (e) {
@@ -349,11 +497,15 @@ class ShoppingCard extends HTMLElement {
 
   // ---------- derived data ----------
 
+  _annotateItem(it) {
+    const parsed = parseItemText(it.summary);
+    const completed = it.status === "completed";
+    const lineTotal = parsed.price !== null ? parsed.price * parsed.qty : null;
+    return { ...it, ...parsed, description: it.description || "", completed, lineTotal };
+  }
+
   _processedItems() {
-    let items = this._items.map((it) => {
-      const parsed = parseItemText(it.summary);
-      return { ...it, ...parsed, description: it.description || "", completed: it.status === "completed" };
-    });
+    let items = this._items.map((it) => this._annotateItem(it));
 
     if (this._filterText) {
       const f = this._filterText.toLowerCase();
@@ -365,7 +517,7 @@ class ShoppingCard extends HTMLElement {
       );
     }
 
-    if (!this._config.show_completed) {
+    if (!this._config.show_completed || this._shoppingMode) {
       items = items.filter((it) => !it.completed);
     }
 
@@ -393,7 +545,7 @@ class ShoppingCard extends HTMLElement {
         case "alpha":
           return collator.compare(a.name, b.name);
         case "price":
-          return (b.price ?? -Infinity) - (a.price ?? -Infinity);
+          return (b.lineTotal ?? -Infinity) - (a.lineTotal ?? -Infinity);
         default:
           return 0;
       }
@@ -446,17 +598,21 @@ class ShoppingCard extends HTMLElement {
       return;
     }
 
-    const allItems = this._items.map((it) => ({ ...it, ...parseItemText(it.summary) }));
+    const allItems = this._items.map((it) => this._annotateItem(it));
     const total = allItems.length;
     const completedCount = allItems.filter((it) => it.status === "completed").length;
     const progressPct = total ? Math.round((completedCount / total) * 100) : 0;
-    const openTotal = allItems
-      .filter((it) => it.status !== "completed" && it.price !== null)
-      .reduce((sum, it) => sum + it.price, 0);
+    const estimatedTotal = allItems
+      .filter((it) => it.lineTotal !== null)
+      .reduce((sum, it) => sum + it.lineTotal, 0);
+    const cartTotal = allItems
+      .filter((it) => it.status === "completed" && it.lineTotal !== null)
+      .reduce((sum, it) => sum + it.lineTotal, 0);
 
     const processed = this._processedItems();
     const groups = this._groupItems(processed);
     const categories = this._categories();
+    const shoppingMode = this._shoppingMode;
 
     const groupsHtml = !this._loaded
       ? `<div class="empty-state">Loading…</div>`
@@ -467,40 +623,73 @@ class ShoppingCard extends HTMLElement {
       : groups.map((g) => this._renderGroup(g)).join("");
 
     this.shadowRoot.innerHTML = this._styles() + `
-      <ha-card>
+      <ha-card class="${shoppingMode ? "shopping-mode" : ""}">
         <div class="header">
           <div class="title-row">
             <span class="title">${escapeHtml(this._config.title)}</span>
             ${
-              this._config.show_prices && openTotal > 0
-                ? `<span class="total-price">${escapeHtml(formatPrice(openTotal, this._config.currency))}</span>`
+              this._config.show_prices && (estimatedTotal > 0 || cartTotal > 0)
+                ? `<div class="totals">
+                    ${
+                      estimatedTotal > 0
+                        ? `<span class="total-chip estimate" title="Estimated total (all items)">${escapeHtml(formatPrice(estimatedTotal, this._config.currency))}</span>`
+                        : ""
+                    }
+                    ${
+                      cartTotal > 0
+                        ? `<span class="total-chip cart" title="Cart total (checked off)"><ha-icon icon="mdi:cart-outline"></ha-icon>${escapeHtml(formatPrice(cartTotal, this._config.currency))}</span>`
+                        : ""
+                    }
+                   </div>`
                 : ""
             }
           </div>
           <div class="toolbar">
             ${
-              this._config.show_search
+              !shoppingMode && this._config.show_search
                 ? `<button class="icon-btn" data-action="toggle-search" title="Search">
                     <ha-icon icon="mdi:magnify"></ha-icon>
                    </button>`
                 : ""
             }
-            <select class="sort-select" data-action="change-sort" title="Sort">
-              ${SORT_OPTIONS.map(
-                (o) =>
-                  `<option value="${o.value}" ${o.value === this._config.sort ? "selected" : ""}>${o.label}</option>`
-              ).join("")}
-            </select>
-            <button
-              class="icon-btn ${this._config.group_by_category ? "active" : ""}"
-              data-action="toggle-group"
-              title="Group by category"
-            >
-              <ha-icon icon="mdi:shape-outline"></ha-icon>
-            </button>
+            ${
+              !shoppingMode
+                ? `<select class="sort-select" data-action="change-sort" title="Sort">
+                    ${SORT_OPTIONS.map(
+                      (o) =>
+                        `<option value="${o.value}" ${o.value === this._config.sort ? "selected" : ""}>${o.label}</option>`
+                    ).join("")}
+                   </select>
+                   <button
+                     class="icon-btn ${this._config.group_by_category ? "active" : ""}"
+                     data-action="toggle-group"
+                     title="Group by category"
+                   >
+                     <ha-icon icon="mdi:shape-outline"></ha-icon>
+                   </button>`
+                : ""
+            }
+            ${
+              this._config.nav_button_path
+                ? `<button class="icon-btn" data-action="nav-button" title="${escapeHtml(this._config.nav_button_label || "Open")}">
+                    <ha-icon icon="${escapeHtml(this._config.nav_button_icon || "mdi:open-in-new")}"></ha-icon>
+                   </button>`
+                : ""
+            }
+            ${
+              this._config.show_shopping_mode_button
+                ? `<button
+                    class="icon-btn ${shoppingMode ? "active" : ""}"
+                    data-action="toggle-shopping-mode"
+                    title="Shopping mode"
+                  >
+                    <ha-icon icon="${shoppingMode ? "mdi:fullscreen-exit" : "mdi:fullscreen"}"></ha-icon>
+                   </button>`
+                : ""
+            }
           </div>
           ${
-            this._config.show_search && this._searchOpen
+            !shoppingMode && this._config.show_search && this._searchOpen
               ? `<input
                   type="text"
                   class="search-input"
@@ -523,7 +712,7 @@ class ShoppingCard extends HTMLElement {
         <div class="items">${groupsHtml}</div>
 
         ${
-          completedCount > 0
+          !shoppingMode && completedCount > 0
             ? `<div class="footer">
                 <button class="text-btn" data-action="clear-completed">
                   <ha-icon icon="mdi:broom"></ha-icon> Clear completed
@@ -541,8 +730,8 @@ class ShoppingCard extends HTMLElement {
     const label = group.category || "Uncategorized";
     const color = categoryColor(group.category);
     const subtotal = group.items
-      .filter((it) => it.status !== "completed" && it.price !== null)
-      .reduce((sum, it) => sum + it.price, 0);
+      .filter((it) => it.status !== "completed" && it.lineTotal !== null)
+      .reduce((sum, it) => sum + it.lineTotal, 0);
 
     const headerHtml =
       this._config.group_by_category
@@ -571,6 +760,11 @@ class ShoppingCard extends HTMLElement {
     }
     const color = categoryColor(item.category);
     const draggable = this._dragEnabled();
+    const shoppingMode = this._shoppingMode;
+    const priceTitle =
+      item.price !== null && item.qty > 1
+        ? `${formatPrice(item.price, this._config.currency)} × ${item.qty}`
+        : "";
     return `<div
       class="item ${item.completed ? "completed" : ""}"
       data-uid="${escapeHtml(item.uid)}"
@@ -585,6 +779,7 @@ class ShoppingCard extends HTMLElement {
       <input type="checkbox" class="checkbox" data-action="toggle-item" data-uid="${escapeHtml(item.uid)}" ${item.completed ? "checked" : ""} />
       <div class="item-body">
         <div class="item-main-row">
+          ${item.qty > 1 ? `<span class="qty-chip">×${item.qty}</span>` : ""}
           <span class="item-name">${escapeHtml(item.name) || "(no name)"}</span>
           ${
             this._config.show_categories && item.category
@@ -592,19 +787,23 @@ class ShoppingCard extends HTMLElement {
               : ""
           }
           ${
-            this._config.show_prices && item.price !== null
-              ? `<span class="price">${escapeHtml(formatPrice(item.price, this._config.currency))}</span>`
+            this._config.show_prices && item.lineTotal !== null
+              ? `<span class="price" title="${escapeHtml(priceTitle)}">${escapeHtml(formatPrice(item.lineTotal, this._config.currency))}</span>`
               : ""
           }
         </div>
         ${item.description ? `<div class="item-desc">${escapeHtml(item.description)}</div>` : ""}
       </div>
-      <button class="icon-btn small" data-action="edit-item" data-uid="${escapeHtml(item.uid)}" title="Edit">
-        <ha-icon icon="mdi:pencil"></ha-icon>
-      </button>
-      <button class="icon-btn small" data-action="delete-item" data-uid="${escapeHtml(item.uid)}" title="Delete">
-        <ha-icon icon="mdi:delete-outline"></ha-icon>
-      </button>
+      ${
+        shoppingMode
+          ? ""
+          : `<button class="icon-btn small" data-action="edit-item" data-uid="${escapeHtml(item.uid)}" title="Edit">
+              <ha-icon icon="mdi:pencil"></ha-icon>
+            </button>
+            <button class="icon-btn small" data-action="delete-item" data-uid="${escapeHtml(item.uid)}" title="Delete">
+              <ha-icon icon="mdi:delete-outline"></ha-icon>
+            </button>`
+      }
     </div>`;
   }
 
@@ -614,6 +813,7 @@ class ShoppingCard extends HTMLElement {
       <form class="edit-form" data-form="edit" data-uid="${escapeHtml(item.uid)}">
         <div class="edit-row">
           <input type="text" name="name" class="edit-name" value="${escapeHtml(item.name)}" placeholder="Name" autofocus />
+          <input type="number" name="qty" class="edit-qty" min="1" step="1" value="${item.qty || 1}" title="Quantity" />
           <input type="text" name="category" class="edit-category" value="${escapeHtml(item.category || "")}" placeholder="Category" list="sc-categories" />
           <input type="number" name="price" class="edit-price" step="0.01" min="0" value="${item.price !== null ? item.price : ""}" placeholder="Price" />
           <button type="submit" class="icon-btn small primary" title="Save"><ha-icon icon="mdi:check"></ha-icon></button>
@@ -630,25 +830,36 @@ class ShoppingCard extends HTMLElement {
 
   _renderAddForm(categories) {
     const descriptionSupported = this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION);
+    const shoppingMode = this._shoppingMode;
     return `<form class="add-form" data-form="add">
       <div class="add-row">
         <input type="text" name="name" class="add-name" placeholder="Add item…" autocomplete="off" required />
-        <button type="button" class="icon-btn ${this._addExtraOpen ? "active" : ""}" data-action="toggle-add-extra" title="More options">
-          <ha-icon icon="mdi:tune-variant"></ha-icon>
-        </button>
+        ${shoppingMode ? "" : `<span class="suggest-hint"></span>`}
+        ${
+          shoppingMode
+            ? ""
+            : `<button type="button" class="icon-btn ${this._addExtraOpen ? "active" : ""}" data-action="toggle-add-extra" title="More options">
+                <ha-icon icon="mdi:tune-variant"></ha-icon>
+              </button>`
+        }
         <button type="submit" class="icon-btn primary" title="Add">
           <ha-icon icon="mdi:plus"></ha-icon>
         </button>
       </div>
-      <div class="add-extra" ${this._addExtraOpen ? "" : "hidden"}>
-        <input type="text" name="category" class="add-category" placeholder="Category" list="sc-categories" />
-        <input type="number" name="price" class="add-price" step="0.01" min="0" placeholder="Price" />
-        ${
-          descriptionSupported
-            ? `<input type="text" name="description" class="add-description" placeholder="Note" />`
-            : ""
-        }
-      </div>
+      ${
+        shoppingMode
+          ? ""
+          : `<div class="add-extra" ${this._addExtraOpen ? "" : "hidden"}>
+              <input type="number" name="qty" class="add-qty" min="1" step="1" placeholder="Qty" title="Quantity" />
+              <input type="text" name="category" class="add-category" placeholder="Category" list="sc-categories" />
+              <input type="number" name="price" class="add-price" step="0.01" min="0" placeholder="Price" />
+              ${
+                descriptionSupported
+                  ? `<input type="text" name="description" class="add-description" placeholder="Note" />`
+                  : ""
+              }
+             </div>`
+      }
       <datalist id="sc-categories">
         ${categories.map((c) => `<option value="${escapeHtml(c)}"></option>`).join("")}
       </datalist>
@@ -660,9 +871,19 @@ class ShoppingCard extends HTMLElement {
       :host { display: block; }
       ha-card { padding: 0; overflow: hidden; }
       .header { padding: 16px 16px 8px; }
-      .title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+      .title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
       .title { font-size: 1.2em; font-weight: 500; color: var(--primary-text-color); }
-      .total-price { font-size: 1em; font-weight: 600; color: var(--primary-color); }
+      .totals { display: flex; align-items: center; gap: 6px; }
+      .total-chip {
+        display: inline-flex; align-items: center; gap: 4px;
+        font-size: 0.85em; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+      }
+      .total-chip ha-icon { --mdc-icon-size: 15px; }
+      .total-chip.estimate { color: var(--secondary-text-color); }
+      .total-chip.cart {
+        color: var(--primary-color);
+        background: rgba(var(--rgb-primary-color, 3,169,244), 0.12);
+      }
       .toolbar { display: flex; align-items: center; gap: 4px; margin-top: 8px; }
       .sort-select {
         flex: 1;
@@ -733,10 +954,14 @@ class ShoppingCard extends HTMLElement {
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
       .chip { font-size: 0.75em; font-weight: 600; padding: 2px 8px; border-radius: 10px; flex-shrink: 0; }
+      .qty-chip {
+        font-size: 0.75em; font-weight: 700; color: var(--primary-color); flex-shrink: 0;
+      }
       .price { font-size: 0.85em; font-weight: 600; color: var(--primary-text-color); flex-shrink: 0; }
       .edit-form { display: flex; flex-direction: column; gap: 6px; width: 100%; }
       .edit-row { display: flex; align-items: center; gap: 6px; width: 100%; flex-wrap: wrap; }
       .edit-name { flex: 2; min-width: 100px; }
+      .edit-qty { width: 56px; }
       .edit-category { flex: 1; min-width: 80px; }
       .edit-price { width: 80px; }
       .edit-description { width: 100%; box-sizing: border-box; resize: vertical; }
@@ -748,14 +973,24 @@ class ShoppingCard extends HTMLElement {
       }
       .text-btn:hover { background: rgba(var(--rgb-primary-text-color, 0,0,0), 0.06); }
       .add-form { display: flex; flex-direction: column; gap: 6px; padding: 8px 16px 16px; border-top: 1px solid var(--divider-color); margin-top: 4px; padding-top: 12px; }
-      .add-row { display: flex; align-items: center; gap: 4px; }
+      .add-row { display: flex; align-items: center; gap: 4px; position: relative; }
       .add-name { flex: 1; min-width: 100px; }
+      .suggest-hint {
+        position: absolute; left: 12px; top: 100%; margin-top: 2px;
+        font-size: 0.75em; color: var(--secondary-text-color); pointer-events: none;
+      }
       .add-extra { display: flex; gap: 6px; width: 100%; flex-wrap: wrap; }
       .add-extra[hidden] { display: none; }
+      .add-qty { width: 56px; }
       .add-category { flex: 1; min-width: 80px; }
       .add-price { width: 90px; }
       .add-description { flex: 2; min-width: 120px; }
       code { background: rgba(var(--rgb-primary-text-color, 0,0,0), 0.06); padding: 1px 4px; border-radius: 4px; }
+
+      /* Shopping mode: bigger touch targets, fewer distractions while walking the aisles. */
+      .shopping-mode .item { padding: 12px 8px; font-size: 1.05em; }
+      .shopping-mode .checkbox { width: 26px; height: 26px; }
+      .shopping-mode .add-row .icon-btn.primary { width: 44px; height: 44px; }
     </style>`;
   }
 
@@ -812,6 +1047,17 @@ class ShoppingCard extends HTMLElement {
             target.classList.toggle("active", this._addExtraOpen);
           }
           break;
+        case "toggle-shopping-mode":
+          this._shoppingMode = !this._shoppingMode;
+          this._savePrefs();
+          this._render();
+          break;
+        case "nav-button":
+          if (this._config.nav_button_path) {
+            history.pushState(null, "", this._config.nav_button_path);
+            window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: false } }));
+          }
+          break;
         default:
           break;
       }
@@ -831,6 +1077,28 @@ class ShoppingCard extends HTMLElement {
       if (ev.target.matches('[data-role="search"]')) {
         this._filterText = ev.target.value;
         this._applySearchFilter();
+        return;
+      }
+      if (ev.target.matches(".add-name")) {
+        if (this._shoppingMode) return;
+        const name = ev.target.value;
+        const hint = root.querySelector(".suggest-hint");
+        if (!this._addCategoryTouched) {
+          const suggestion = this._suggestCategory(name);
+          const catInput = root.querySelector(".add-category");
+          if (catInput) catInput.value = suggestion;
+          if (hint) hint.textContent = suggestion ? `→ ${suggestion}` : "";
+        }
+        const priceInput = root.querySelector(".add-price");
+        if (priceInput) {
+          const suggestedPrice = this._suggestPrice(name);
+          priceInput.placeholder =
+            suggestedPrice !== null ? `~${formatPrice(suggestedPrice, this._config.currency)}` : "Price";
+        }
+        return;
+      }
+      if (ev.target.matches(".add-category")) {
+        this._addCategoryTouched = ev.target.value !== "";
       }
     });
 
@@ -846,11 +1114,17 @@ class ShoppingCard extends HTMLElement {
         const category = (data.get("category") || "").toString().trim();
         const price = (data.get("price") || "").toString().trim();
         const description = (data.get("description") || "").toString().trim();
-        this._addItem(name, category, price === "" ? null : price, description);
+        const qty = (data.get("qty") || "").toString().trim();
+        this._addItem(name, category, price === "" ? null : price, description, qty === "" ? 1 : qty);
         form.reset();
         const extra = form.querySelector(".add-extra");
         if (extra) extra.hidden = true;
         this._addExtraOpen = false;
+        this._addCategoryTouched = false;
+        const hint = form.querySelector(".suggest-hint");
+        if (hint) hint.textContent = "";
+        const priceInput = form.querySelector(".add-price");
+        if (priceInput) priceInput.placeholder = "Price";
       } else if (form.dataset.form === "edit") {
         const uid = form.dataset.uid;
         const data = new FormData(form);
@@ -858,8 +1132,9 @@ class ShoppingCard extends HTMLElement {
         const category = (data.get("category") || "").toString().trim();
         const price = (data.get("price") || "").toString().trim();
         const description = (data.get("description") || "").toString().trim();
+        const qty = (data.get("qty") || "").toString().trim();
         this._editingUid = null;
-        this._renameItem(uid, name, category, price === "" ? null : price, description);
+        this._renameItem(uid, name, category, price === "" ? null : price, description, qty === "" ? 1 : qty);
       }
     });
 
@@ -974,6 +1249,10 @@ class ShoppingCardEditor extends HTMLElement {
       { name: "show_progress", selector: { boolean: {} } },
       { name: "show_search", selector: { boolean: {} } },
       { name: "show_add", selector: { boolean: {} } },
+      { name: "show_shopping_mode_button", selector: { boolean: {} } },
+      { name: "nav_button_label", selector: { text: {} } },
+      { name: "nav_button_icon", selector: { icon: {} } },
+      { name: "nav_button_path", selector: { text: {} } },
     ];
   }
 
@@ -991,6 +1270,10 @@ class ShoppingCardEditor extends HTMLElement {
       show_progress: "Show progress bar",
       show_search: "Show search",
       show_add: "Show quick-add form",
+      show_shopping_mode_button: "Show \"Shopping mode\" button",
+      nav_button_label: "Extra button: label (optional)",
+      nav_button_icon: "Extra button: icon",
+      nav_button_path: "Extra button: navigates to (dashboard path, optional)",
     };
   }
 
@@ -1022,7 +1305,7 @@ window.customCards.push({
   type: CARD_TAG,
   name: "Shopping List Card",
   description:
-    "Editable shopping list card backed by a Home Assistant todo entity, with categories, prices, notes, drag-to-reorder and quick add/edit.",
+    "Editable shopping list card backed by a Home Assistant todo entity, with categories, prices, quantities, notes, drag-to-reorder, category/price suggestions and a shopping mode.",
   preview: true,
   documentationURL: "https://github.com/jan-tdy/ha-shopping-card",
 });

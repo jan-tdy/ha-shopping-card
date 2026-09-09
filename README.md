@@ -15,6 +15,16 @@ by category, track prices, and see your progress — all from the card.
 - **Drag to reorder** — manual sort supports dragging items into the order you actually
   shop in (e.g. by store aisle).
 - **Sorting** — manual (drag-orderable), alphabetical, or by price.
+- **Quantity** — type `2x Milk` or `Milk x2`, or use the Qty field; totals and sorting use
+  quantity × unit price.
+- **Category & price suggestions** — a built-in dictionary suggests a category as you type
+  (e.g. "Milk" → Dairy); once you've set a category or price for an item, the card remembers
+  it and suggests it again next time.
+- **Dual totals** — an estimated total (everything on the list) and a cart total (only items
+  checked off), so you can track spending in real time.
+- **Shopping mode** — a fullscreen-style toggle for one-handed use while pushing a cart: hides
+  search/sort controls and completed items, and removes edit/delete/drag controls to prevent
+  accidental taps.
 - **Progress bar** — completed vs. total items.
 - **Search** — filter the list as you type.
 - **Clear completed** — one click to remove everything checked off.
@@ -62,6 +72,10 @@ show_completed: true
 show_progress: true
 show_search: true
 show_add: true
+show_shopping_mode_button: true
+nav_button_label: "Fridge"
+nav_button_icon: mdi:fridge-outline
+nav_button_path: /lovelace/fridge
 ```
 
 | Option               | Default            | Description                                      |
@@ -78,6 +92,10 @@ show_add: true
 | `show_progress`       | `true`               | Show the completed/total progress bar.             |
 | `show_search`         | `true`               | Show the search toggle.                            |
 | `show_add`            | `true`               | Show the quick-add form.                           |
+| `show_shopping_mode_button` | `true`         | Show the fullscreen-style "Shopping mode" toggle.  |
+| `nav_button_label`    | `""`                 | Tooltip for an optional extra toolbar button.      |
+| `nav_button_icon`     | `mdi:fridge-outline` | Icon for the extra button.                         |
+| `nav_button_path`     | `""`                 | Dashboard path the extra button navigates to. Button is hidden unless this is set. |
 
 Sort mode and grouping can also be toggled live from the card's header — that choice is
 remembered per entity in your browser.
@@ -108,6 +126,31 @@ them (`supported_features`). The built-in Home Assistant shopping list supports 
 To reorder, switch sort to **Manual** and drag an item by its handle. When grouped by
 category, you can only reorder within the same category group; turn grouping off for free
 reordering across the whole list.
+
+### Quantity
+
+Add `x2` (or `2x`) anywhere in an item's name — "Milk x2" or "2x Milk" both work — or use the
+Qty field in the add/edit forms. The line price shown, the running totals, and "sort by price"
+all use quantity × unit price.
+
+### Category and price suggestions
+
+As you type an item's name in the quick-add field, the card suggests a category from:
+
+1. What you've manually set for that exact name before (remembered per browser), then
+2. A small built-in dictionary of common groceries (English and Slovak names).
+
+The suggestion fills in the category field automatically — edit it yourself at any point to
+override it for that item. The last price you entered for a name is similarly remembered and
+shown as a placeholder (e.g. "~1.50€") in the price field, as a reminder rather than a
+committed value.
+
+### Shopping mode
+
+Toggle the fullscreen icon in the header to switch into a focused, one-handed layout: search,
+sort/group controls and completed items are hidden, and item rows drop their edit/delete
+buttons and drag handles so you don't accidentally change the list while pushing a cart.
+Checking items off still works as normal. The toggle state is remembered per entity.
 
 ## Requirements
 

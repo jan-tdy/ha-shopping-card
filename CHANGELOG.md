@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.0
+
+- **Category suggestions**: a small built-in dictionary of common groceries (English + Slovak)
+  suggests a category as you type an item's name. Once you manually set a category for a name,
+  the card remembers it (per browser) and suggests it next time.
+- **Price memory**: the last price you entered for an item is remembered and shown as a
+  placeholder hint when adding that item again.
+- **Quantity**: type `2x Milk` or `Milk x2` (or use the Qty field) to set a quantity. Totals,
+  sorting by price, and the displayed price all use quantity × unit price.
+- **Dual totals**: the header now shows an estimated total (everything on the list) and a cart
+  total (only items checked off), so you can track spending in real time at the register.
+- **Shopping mode**: a fullscreen-style toggle that hides the header controls, search and
+  completed items, and removes edit/delete buttons and drag handles to avoid accidental taps
+  while shopping. Bigger touch targets throughout.
+- **Optional extra button**: configure a label, icon and dashboard path to add a second toolbar
+  button that navigates to another view (e.g. a "what's in the fridge" subview).
+
 ## v0.2.0
 
 - Drag-and-drop manual reordering of items (uses the entity's native move support).
