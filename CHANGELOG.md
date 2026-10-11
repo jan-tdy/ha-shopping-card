@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.1
+
+### Fixed
+- Item names containing a `#` followed by a number (e.g. "Room #205", "Sandpaper grit #220")
+  are no longer mistaken for a `#tag`-style category. A category tag must now contain at least
+  one non-digit character. (#4)
+
 ## v0.4.0
 
 ### Fixed
