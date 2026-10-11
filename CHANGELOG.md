@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.0
+
+### Fixed
+- Preserve partially entered item names, edit values, and search text when the card re-renders.
+- Restore focus to the active field after a re-render, with the caret at the end of the text. (#8)
+
 ## v0.3.0
 
 - **Category suggestions**: a small built-in dictionary of common groceries (English + Slovak)

@@ -6,7 +6,7 @@
  * https://github.com/jan-tdy/ha-shopping-card
  */
 
-const CARD_VERSION = "0.3.0";
+const CARD_VERSION = "0.4.0";
 const CARD_TAG = "shopping-card";
 const EDITOR_TAG = "shopping-card-editor";
 
@@ -584,8 +584,86 @@ class ShoppingCard extends HTMLElement {
 
   // ---------- rendering ----------
 
+  // Fields the reader may be typing into when a re-render lands on them. Closing over the
+  // form is what keeps a re-render from wiping a half-typed item: the card is rebuilt with
+  // `innerHTML` on every entity change, so without this a partner checking an item, or a voice
+  // add, discarded whatever was in the add form and the search box.
+  _liveFields() {
+    return [
+      ".add-name",
+      ".add-qty",
+      ".add-category",
+      ".add-price",
+      ".add-description",
+      ".edit-name",
+      ".edit-qty",
+      ".edit-category",
+      ".edit-price",
+      ".edit-description",
+      ".search-input",
+    ];
+  }
+
+  _captureFieldState() {
+    const state = {};
+    const active = this.shadowRoot && this.shadowRoot.activeElement;
+    const entity = this._config?.entity;
+    for (const selector of this._liveFields()) {
+      const el = this.shadowRoot.querySelector(selector);
+      if (!el) continue;
+      const editRow = el.closest(".item.editing");
+      state[selector] = {
+        value: el.value,
+        focused: el === active,
+        entity,
+        editUid: editRow ? editRow.dataset.uid : null,
+      };
+    }
+    return state;
+  }
+
+  _restoreFieldState(state) {
+    if (!state) return;
+    const entity = this._config?.entity;
+    let refocus = null;
+    for (const selector of this._liveFields()) {
+      const saved = state[selector];
+      // A capture from a different entity (setConfig() switched the list)
+      // must never seed this entity's form.
+      if (!saved || saved.entity !== entity) continue;
+      const el = this.shadowRoot.querySelector(selector);
+      if (!el) continue;
+      if (saved.editUid !== null) {
+        // Edit fields are always populated by the rebuild (the item's current value),
+        // so "only fill empty" never restores a typed edit. Carry the draft over only
+        // when the rebuild is still the same item's edit row.
+        const editRow = el.closest(".item.editing");
+        if (!editRow || editRow.dataset.uid !== saved.editUid) continue;
+        el.value = saved.value;
+      } else if (el.value === "") {
+        // Only fill a field the rebuild left empty, so values written by the card itself
+        // are not overwritten by a stale capture.
+        el.value = saved.value;
+      }
+      if (saved.focused) refocus = el;
+    }
+    if (refocus) {
+      refocus.focus();
+      // Put the caret back at the end so typing continues where it left off.
+      try {
+        const end = refocus.value.length;
+        refocus.setSelectionRange(end, end);
+      } catch (_e) {
+        /* not every input type supports a selection range */
+      }
+    }
+  }
+
   _render() {
     if (!this._config) return;
+
+    // Capture before the shadow root is replaced below: the elements are gone afterwards.
+    const fieldState = this._captureFieldState();
 
     if (!this._hass || !this._hass.states[this._config.entity]) {
       this.shadowRoot.innerHTML = this._styles() + `
@@ -595,6 +673,7 @@ class ShoppingCard extends HTMLElement {
             It must be a <code>todo</code> entity (e.g. your Home Assistant shopping list).
           </div>
         </ha-card>`;
+      this._restoreFieldState(fieldState);
       return;
     }
 
@@ -721,11 +800,13 @@ class ShoppingCard extends HTMLElement {
             : ""
         }
 
-        ${this._config.show_add ? this._renderAddForm(categories) : ""}
-      </ha-card>`;
-  }
+              ${this._config.show_add ? this._renderAddForm(categories) : ""}
+            </ha-card>`;
 
-  _renderGroup(group) {
+          // Put back what was being typed, and the caret, into the freshly built form.
+          this._restoreFieldState(fieldState);
+        }
+        _renderGroup(group) {
     const isCollapsed = group.category !== null && this._collapsed.has(group.category);
     const label = group.category || "Uncategorized";
     const color = categoryColor(group.category);
