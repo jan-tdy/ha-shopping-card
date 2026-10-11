@@ -6,7 +6,7 @@
  * https://github.com/jan-tdy/ha-shopping-card
  */
 
-const CARD_VERSION = "0.4.0";
+const CARD_VERSION = "0.4.1";
 const CARD_TAG = "shopping-card";
 const EDITOR_TAG = "shopping-card-editor";
 
@@ -115,14 +115,20 @@ function parseItemText(rawSummary) {
   let price = null;
   let qty = 1;
 
-  const catMatch = name.match(/#([^\s#]+)/);
+  // Require at least one non-digit character, so a part/model/room number like
+  // "#205" or "#220" isn't mistaken for a "#Dairy"-style category tag (categories
+  // are always words, see CATEGORY_DICTIONARY).
+  const catMatch = name.match(/#([^\s#]*[^\s#0-9][^\s#]*)/);
   if (catMatch) {
     category = catMatch[1].replace(/_/g, " ");
     name = name.slice(0, catMatch.index) + name.slice(catMatch.index + catMatch[0].length);
   }
 
   // Quantity: "2x Milk" or "Milk x2" (word-bounded, so "2x2 tile" is left alone).
-  const qtyMatch = name.match(/\b(\d+)\s*[x×]\b|\b[x×]\s*(\d+)\b/i);
+  // The digit can't be directly preceded by "#" either, so a part/model number
+  // left untouched above (e.g. "#8" in "Wood screws #8 x 1in") isn't then misread
+  // as a quantity by the "digit x" side of this pattern.
+  const qtyMatch = name.match(/(?<!#)\b(\d+)\s*[x×]\b|\b[x×]\s*(\d+)\b/i);
   if (qtyMatch) {
     const n = parseInt(qtyMatch[1] ?? qtyMatch[2], 10);
     if (!Number.isNaN(n) && n > 0) qty = n;
