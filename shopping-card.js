@@ -6,7 +6,7 @@
  * https://github.com/jan-tdy/ha-shopping-card
  */
 
-const CARD_VERSION = "0.4.1";
+const CARD_VERSION = "0.4.2";
 const CARD_TAG = "shopping-card";
 const EDITOR_TAG = "shopping-card-editor";
 
@@ -128,7 +128,11 @@ function parseItemText(rawSummary) {
   // The digit can't be directly preceded by "#" either, so a part/model number
   // left untouched above (e.g. "#8" in "Wood screws #8 x 1in") isn't then misread
   // as a quantity by the "digit x" side of this pattern.
-  const qtyMatch = name.match(/(?<!#)\b(\d+)\s*[x×]\b|\b[x×]\s*(\d+)\b/i);
+  // Real quantity shorthand only ever has a digit on ONE side of the "x"; an
+  // "A x B" dimension (bolt/lumber sizes like "M8 x30" or "2 x 6") has a digit
+  // on BOTH sides, so each side is rejected when a digit (ignoring whitespace)
+  // also sits on the other side of the "x".
+  const qtyMatch = name.match(/(?<!#)\b(\d+)\s*[x×]\b(?!\s*\d)|(?<!\d\s*)\b[x×]\s*(\d+)\b/i);
   if (qtyMatch) {
     const n = parseInt(qtyMatch[1] ?? qtyMatch[2], 10);
     if (!Number.isNaN(n) && n > 0) qty = n;

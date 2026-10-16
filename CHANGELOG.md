@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.2
+
+### Fixed
+- "A x B" dimension notation for hardware/building-materials items (e.g. "M8 x30", "Beam 2 x 6",
+  "Post 4 x 4") is no longer mistaken for `qty x item` quantity shorthand. A digit on both sides
+  of the "x" is now recognized as a dimension and left untouched; genuine quantity shorthand
+  (a digit on only one side, e.g. "2x Milk" / "Milk x2") still works. (#5)
+
 ## v0.4.1
 
 ### Fixed
