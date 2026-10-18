@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Replaced the small "estimated"/"cart" total chips in the header with a big, always-visible
+  price-tracking bar ("To buy" / "Bought") right under it — in line with the prominent running
+  totals of other shopping-list apps, instead of easy-to-miss inline chips.
+
 ## v2.0.0-beta0
 
 ### Added
