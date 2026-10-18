@@ -29,6 +29,8 @@ by category, track prices, and see your progress — all from the card.
 - **Search** — filter the list as you type.
 - **Clear completed** — one click to remove everything checked off.
 - **Visual editor** — configure entirely through the GUI card editor, no YAML needed.
+- **Superscan mode (v2.0.0-beta0, beta)** — scan barcodes with the camera instead of checking
+  items off by hand. See [Superscan mode](#superscan-mode-beta) below.
 
 Notes and drag-reordering only appear when the underlying `todo` entity supports them
 (most integrations, including the built-in shopping list, do).
@@ -96,6 +98,9 @@ nav_button_path: /lovelace/fridge
 | `nav_button_label`    | `""`                 | Tooltip for an optional extra toolbar button.      |
 | `nav_button_icon`     | `mdi:fridge-outline` | Icon for the extra button.                         |
 | `nav_button_path`     | `""`                 | Dashboard path the extra button navigates to. Button is hidden unless this is set. |
+| `mode`                | `normal`             | `normal` or `superscan` (barcode scanning, beta). See below. |
+| `mercadona_postal_code` | `""`               | Superscan: your postal code, used to guess the Mercadona price zone. Best-effort only. |
+| `mercadona_warehouse` | `""`                 | Superscan: manual Mercadona warehouse code override. See below. |
 
 Sort mode and grouping can also be toggled live from the card's header — that choice is
 remembered per entity in your browser.
@@ -151,6 +156,44 @@ Toggle the fullscreen icon in the header to switch into a focused, one-handed la
 sort/group controls and completed items are hidden, and item rows drop their edit/delete
 buttons and drag handles so you don't accidentally change the list while pushing a cart.
 Checking items off still works as normal. The toggle state is remembered per entity.
+
+### Superscan mode (beta)
+
+Set `mode: superscan` to switch from checking items off by hand to scanning their barcode
+with the camera. Tap the barcode icon in the header to open the scanner; point the camera at
+a product's barcode and hold it steady.
+
+- **On the list** — if the scanned product's name matches an item still on the list, that item
+  is checked off automatically (and its price filled in, if it didn't have one yet).
+- **Not on the list** — otherwise it's logged once as an "off-list" purchase for the current
+  session (shown under the list, removable if scanned by mistake) and counted into the
+  "already bought" total, without being added to the list itself.
+- **Unknown barcode** — if the card has never seen the code before and can't look it up, you
+  get a small manual form (name/price/category) instead — fill it in once and the card
+  remembers that barcode for next time, the same way it already remembers categories and
+  prices.
+
+Prices and barcode lookups come **only from Mercadona (Spain)** for now, through their
+unofficial, reverse-engineered search API — not a public/supported API. This is inherently
+best-effort:
+
+- Mercadona's `robots.txt` disallows `/api` for crawlers, and prices/catalog are zoned per
+  delivery warehouse. This card calls it in low volume, for personal/home use, and always
+  falls back to manual entry — but it can stop working at any time if Mercadona changes or
+  blocks it, with no warning.
+- Set `mercadona_postal_code` so the card can *guess* your warehouse; only a handful of
+  postal-code prefixes are known, so this will often fail to resolve anything on its own.
+- If it does, or if you want to be sure, set `mercadona_warehouse` directly: open
+  `tienda.mercadona.es`, search for any product with your browser's DevTools Network tab open,
+  find the request to `*.algolia.net/1/indexes/products_prod_<code>_es/query`, and use that
+  `<code>` (e.g. `mad1`, `bcn1`, `vlc1`).
+- Once a barcode is matched once (live or typed in manually), it's remembered locally forever
+  and never needs a network lookup again.
+
+Barcode decoding uses the browser's built-in `BarcodeDetector` API (Chrome/Edge, including on
+Android) where available, and lazy-loads [ZXing](https://github.com/zxing-js/library) from a
+CDN as a fallback otherwise (e.g. iOS Safari) — only when the scanner is actually opened.
+Camera access requires a secure context (HTTPS, or `localhost`).
 
 ## Requirements
 
