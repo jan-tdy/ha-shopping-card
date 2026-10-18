@@ -6,7 +6,7 @@
  * https://github.com/jan-tdy/ha-shopping-card
  */
 
-const CARD_VERSION = "0.4.2";
+const CARD_VERSION = "2.0.0-beta0";
 const CARD_TAG = "shopping-card";
 const EDITOR_TAG = "shopping-card-editor";
 
@@ -16,6 +16,34 @@ const TODO_FEATURES = {
   MOVE: 8,
   SET_DESCRIPTION: 64,
 };
+
+const MODE_OPTIONS = [
+  { value: "normal", label: "Normal" },
+  { value: "superscan", label: "Superscan (barcode, beta)" },
+];
+
+// v2 "superscan" mode: scan barcodes instead of checking items off by hand.
+// Mercadona (Spain) is the only price/catalog source for now, and only via
+// its unofficial, reverse-engineered search API - there is no public contract
+// for any of this, so every lookup below is best-effort and must always fall
+// back to manual entry without breaking the scan flow.
+const MERCADONA_ALGOLIA_APP_ID = "7UZJKL1DJ0";
+const MERCADONA_ALGOLIA_SEARCH_KEY = "9d8f2e39e90df472b4f2e559a116fe17";
+
+// Postal-code-prefix -> warehouse code, used to pick the right Algolia index
+// (`products_prod_<warehouse>_es`); prices and catalog are zoned per warehouse.
+// Only a handful of codes could be confirmed from public sources - everywhere
+// else, `mercadona_warehouse` must be set by hand (see README) for live
+// lookups to do anything; without it, scanning still works off the local
+// barcode memory and manual entry, just without an automatic price fill.
+const MERCADONA_WAREHOUSE_BY_PROVINCE = {
+  28: "mad1", // Madrid
+  8: "bcn1", // Barcelona
+  46: "vlc1", // Valencia
+  3: "alc1", // Alicante
+};
+
+const BARCODE_FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e"];
 
 // eslint-disable-next-line no-console
 console.info(
@@ -173,6 +201,37 @@ function formatPrice(value, currency) {
   return `${Number(value).toFixed(2)}${currency || "€"}`;
 }
 
+// A manual override always wins; otherwise resolve the postal code's
+// 1-2 digit province prefix against the (necessarily incomplete) warehouse
+// table. Returns null when neither is set/known, meaning: skip the live
+// lookup, don't guess.
+function resolveWarehouse(postalCode, overrideWarehouse, table = MERCADONA_WAREHOUSE_BY_PROVINCE) {
+  if (overrideWarehouse && String(overrideWarehouse).trim()) {
+    return String(overrideWarehouse).trim();
+  }
+  const digits = String(postalCode || "").trim();
+  if (!/^\d{5}$/.test(digits)) return null;
+  const prefix2 = parseInt(digits.slice(0, 2), 10);
+  return table[prefix2] || null;
+}
+
+// Barcodes only ever come from a scanner/manual digit entry, so any
+// non-digit noise is stripped; a very short result isn't a real barcode.
+function normalizeBarcode(raw) {
+  const digits = String(raw || "").replace(/\D/g, "");
+  return digits.length >= 6 ? digits : null;
+}
+
+// Matches a scanned/typed product name against the card's own list - the
+// `todo` item has no barcode field, so this is the only link between the two.
+// Deliberately an exact (trimmed, case-insensitive) match on the parsed name:
+// a fuzzy match risks checking off the wrong item.
+function findMatchingItem(items, name) {
+  const key = String(name || "").trim().toLowerCase();
+  if (!key) return null;
+  return items.find((it) => !it.completed && it.name.trim().toLowerCase() === key) || null;
+}
+
 class ShoppingCard extends HTMLElement {
   constructor() {
     super();
@@ -186,6 +245,14 @@ class ShoppingCard extends HTMLElement {
     this._addCategoryTouched = false;
     this._shoppingMode = false;
     this._listenersBound = false;
+    this._scannerOpen = false;
+    this._scanStatus = null;
+    this._scanPendingCode = null;
+    this._scanBusy = false;
+    this._scanStream = null;
+    this._scanGenRef = 0;
+    this._zxingReader = null;
+    this._offListPurchases = [];
   }
 
   setConfig(config) {
@@ -208,13 +275,21 @@ class ShoppingCard extends HTMLElement {
       nav_button_label: "",
       nav_button_icon: "mdi:fridge-outline",
       nav_button_path: "",
+      mode: "normal",
+      mercadona_postal_code: "",
+      mercadona_warehouse: "",
       ...config,
     };
     this._loadPrefs();
     this._loadLearned();
     this._loadPriceHistory();
+    this._loadBarcodeMap();
     this._render();
     if (this._hass) this._fetchItems();
+  }
+
+  disconnectedCallback() {
+    this._stopScanStream();
   }
 
   set hass(hass) {
@@ -376,6 +451,39 @@ class ShoppingCard extends HTMLElement {
     return this._priceHistory[key] ?? null;
   }
 
+  // ---------- barcode memory (per-entity, local - superscan mode) ----------
+  // Every resolved barcode (from Mercadona or typed in manually) is remembered
+  // forever, the same way category/price suggestions are: the live lookup is
+  // unofficial and best-effort, the local memory is what makes repeat scans
+  // of the same product reliable and instant.
+
+  _loadBarcodeMap() {
+    this._barcodeMap = {};
+    try {
+      const raw = localStorage.getItem(`shopping-card-barcodes-${this._config.entity}`);
+      if (raw) this._barcodeMap = JSON.parse(raw);
+    } catch (e) {
+      // ignore malformed/unavailable storage
+    }
+  }
+
+  _saveBarcodeMap() {
+    try {
+      localStorage.setItem(
+        `shopping-card-barcodes-${this._config.entity}`,
+        JSON.stringify(this._barcodeMap)
+      );
+    } catch (e) {
+      // ignore malformed/unavailable storage
+    }
+  }
+
+  _learnBarcode(code, name, price, category) {
+    if (!code || !name) return;
+    this._barcodeMap[code] = { name, price: price ?? null, category: category ?? null };
+    this._saveBarcodeMap();
+  }
+
   // ---------- capabilities ----------
 
   _supportsFeature(bit) {
@@ -505,6 +613,230 @@ class ShoppingCard extends HTMLElement {
     }
   }
 
+  // ---------- superscan (barcode scanning) ----------
+
+  async _lookupMercadona(code) {
+    const warehouse = resolveWarehouse(
+      this._config.mercadona_postal_code,
+      this._config.mercadona_warehouse
+    );
+    if (!warehouse) return null;
+    try {
+      const url = `https://${MERCADONA_ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/products_prod_${warehouse}_es/query`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-algolia-application-id": MERCADONA_ALGOLIA_APP_ID,
+          "x-algolia-api-key": MERCADONA_ALGOLIA_SEARCH_KEY,
+        },
+        body: JSON.stringify({ query: code, hitsPerPage: 5 }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const hits = data.hits || [];
+      // Only an exact EAN match counts - falling back to "closest" search hit
+      // would silently learn the wrong name/price for this barcode forever.
+      const hit = hits.find((h) => String(h.ean || "") === code);
+      if (!hit) return null;
+      const name = hit.display_name || hit.name || null;
+      if (!name) return null;
+      // Unverified field shape (unofficial API, never confirmed against a
+      // live response) - try the plausible spots, give up to manual entry
+      // rather than show a wrong price.
+      const rawPrice =
+        hit.price_instructions?.unit_price ?? hit.price_instructions?.bulk_price ?? hit.price ?? null;
+      const price = rawPrice !== null && rawPrice !== undefined ? Number(rawPrice) : null;
+      return { name, price: Number.isNaN(price) ? null : price };
+    } catch (e) {
+      // Reverse-engineered, unofficial API: network errors, CORS, a changed
+      // response shape, or Mercadona blocking the request all land here, and
+      // all of them just mean "fall back to manual entry".
+      return null;
+    }
+  }
+
+  async _handleScannedCode(rawCode) {
+    const code = normalizeBarcode(rawCode);
+    if (!code) return;
+    // One scan is handled at a time: while a lookup is in flight or a manual
+    // form is open waiting for input, the camera keeps decoding frames (the
+    // product is usually still under it), but further detections of any
+    // code are ignored until the current one is fully resolved. Without
+    // this, a slow lookup or a user who keeps typing into the manual form
+    // for more than the debounce window re-triggers the same scan and
+    // double-counts an off-list purchase.
+    if (this._scanBusy || this._scanPendingCode) return;
+    this._scanBusy = true;
+
+    const known = this._barcodeMap[code];
+    if (known) {
+      await this._applyScanResolution(code, known.name, known.price, known.category);
+      return;
+    }
+
+    this._scanStatus = { kind: "looking", text: "Hľadám…" };
+    this._render();
+
+    const found = await this._lookupMercadona(code);
+    if (found) {
+      await this._applyScanResolution(code, found.name, found.price, null);
+    } else {
+      this._scanPendingCode = code;
+      this._scanStatus = { kind: "manual", text: `Kód ${code} sa nenašiel - doplň ručne.` };
+      this._scanBusy = false; // resolving now waits on the manual form's own submit
+      this._render();
+    }
+  }
+
+  async _applyScanResolution(code, name, price, category) {
+    const items = this._items.map((it) => this._annotateItem(it));
+    const match = findMatchingItem(items, name);
+    if (match) {
+      if (match.price === null && price !== null && price !== undefined) {
+        await this._renameItem(match.uid, match.name, match.category, price, match.description, match.qty);
+      }
+      await this._setStatus(match.uid, true);
+      this._learnBarcode(code, match.name, price ?? match.price, match.category);
+      this._scanStatus = { kind: "matched", text: `✓ ${name}` };
+    } else {
+      this._offListPurchases.push({ code, name, price: price ?? null, qty: 1, ts: Date.now() });
+      this._learnBarcode(code, name, price, category);
+      this._scanStatus = {
+        kind: "offlist",
+        text:
+          price !== null && price !== undefined
+            ? `+ ${name} (mimo zoznamu, ${formatPrice(price, this._config.currency)})`
+            : `+ ${name} (mimo zoznamu)`,
+      };
+    }
+    this._scanPendingCode = null;
+    this._scanBusy = false;
+    this._render();
+  }
+
+  _removeOffListPurchase(idx) {
+    this._offListPurchases.splice(idx, 1);
+    this._render();
+  }
+
+  async _openScanner() {
+    this._scannerOpen = true;
+    this._scanStatus = null;
+    this._scanPendingCode = null;
+    this._scanBusy = false;
+    this._render();
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+      });
+    } catch (e) {
+      if (this._scannerOpen) {
+        this._scanStatus = { kind: "error", text: "Kamera nie je dostupná." };
+        this._render();
+      }
+      return;
+    }
+    // The overlay may have been closed while getUserMedia() was still
+    // pending - don't resurrect a stream for a scanner that isn't open
+    // anymore, or its camera track would stay on with nothing left to stop it.
+    if (!this._scannerOpen) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    this._scanStream = stream;
+    this._restoreScannerState();
+  }
+
+  _stopScanStream() {
+    this._scanGenRef++; // invalidate any running detection loop
+    if (this._zxingReader) {
+      try {
+        this._zxingReader.reset();
+      } catch (e) {
+        // already stopped
+      }
+      this._zxingReader = null;
+    }
+    if (this._scanStream) {
+      this._scanStream.getTracks().forEach((t) => t.stop());
+      this._scanStream = null;
+    }
+  }
+
+  _closeScanner() {
+    this._scannerOpen = false;
+    this._scanStatus = null;
+    this._scanPendingCode = null;
+    this._scanBusy = false;
+    this._stopScanStream();
+    this._render();
+  }
+
+  // Re-binds the live camera stream (never re-requested) to the <video>
+  // element the last `_render()` just created, since a full innerHTML
+  // rebuild tears down the previous one. Called once from `_openScanner()`
+  // and again at the end of every `_render()` while the scanner is open.
+  _restoreScannerState() {
+    if (!this._scannerOpen || !this._scanStream) return;
+    const video = this.shadowRoot.querySelector(".scan-video");
+    if (!video) return;
+    video.srcObject = this._scanStream;
+    video.play().catch(() => {});
+    this._startDetectionLoop(video);
+  }
+
+  async _startDetectionLoop(video) {
+    // Bumping the generation is enough to retire any loop/callback bound to a
+    // previous (now-detached) <video> element - see the gen checks below.
+    const gen = ++this._scanGenRef;
+
+    if ("BarcodeDetector" in window) {
+      const detector = new window.BarcodeDetector({ formats: BARCODE_FORMATS });
+      const tick = async () => {
+        if (gen !== this._scanGenRef || !this._scannerOpen) return;
+        try {
+          const codes = await detector.detect(video);
+          if (codes[0]) this._handleScannedCode(codes[0].rawValue);
+        } catch (e) {
+          // transient decode errors between frames are normal
+        }
+        if (gen === this._scanGenRef && this._scannerOpen) requestAnimationFrame(tick);
+      };
+      tick();
+      return;
+    }
+
+    // Fallback for browsers without the Shape Detection API (e.g. iOS Safari):
+    // lazy-load ZXing from a CDN once, then just reset() + rebind the same
+    // reader to each new <video> element a re-render creates, instead of
+    // re-importing/recreating it on every single status update.
+    if (!this._zxingReader) {
+      try {
+        const zxing = await import(
+          "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/esm/index.min.js"
+        );
+        if (gen !== this._scanGenRef || !this._scannerOpen) return;
+        this._zxingReader = new zxing.BrowserMultiFormatReader();
+      } catch (e) {
+        this._scanStatus = { kind: "error", text: "Skener sa nepodarilo načítať (skús iný prehliadač)." };
+        this._render();
+        return;
+      }
+    } else {
+      try {
+        this._zxingReader.reset();
+      } catch (e) {
+        // already idle
+      }
+    }
+    this._zxingReader.decodeFromVideoElement(video, (result) => {
+      if (gen !== this._scanGenRef) return;
+      if (result) this._handleScannedCode(result.getText());
+    });
+  }
+
   // ---------- derived data ----------
 
   _annotateItem(it) {
@@ -611,6 +943,9 @@ class ShoppingCard extends HTMLElement {
       ".edit-price",
       ".edit-description",
       ".search-input",
+      ".scan-manual-name",
+      ".scan-manual-price",
+      ".scan-manual-category",
     ];
   }
 
@@ -671,6 +1006,9 @@ class ShoppingCard extends HTMLElement {
 
   _render() {
     if (!this._config) return;
+    // Defensive default: a test harness (or any caller) that skips the real
+    // constructor would otherwise crash here instead of just rendering empty.
+    if (!this._offListPurchases) this._offListPurchases = [];
 
     // Capture before the shadow root is replaced below: the elements are gone afterwards.
     const fieldState = this._captureFieldState();
@@ -694,9 +1032,14 @@ class ShoppingCard extends HTMLElement {
     const estimatedTotal = allItems
       .filter((it) => it.lineTotal !== null)
       .reduce((sum, it) => sum + it.lineTotal, 0);
-    const cartTotal = allItems
-      .filter((it) => it.status === "completed" && it.lineTotal !== null)
-      .reduce((sum, it) => sum + it.lineTotal, 0);
+    const offListTotal = this._offListPurchases.reduce(
+      (sum, p) => sum + (p.price || 0) * (p.qty || 1),
+      0
+    );
+    const cartTotal =
+      allItems
+        .filter((it) => it.status === "completed" && it.lineTotal !== null)
+        .reduce((sum, it) => sum + it.lineTotal, 0) + offListTotal;
 
     const processed = this._processedItems();
     const groups = this._groupItems(processed);
@@ -776,6 +1119,13 @@ class ShoppingCard extends HTMLElement {
                    </button>`
                 : ""
             }
+            ${
+              this._config.mode === "superscan"
+                ? `<button class="icon-btn" data-action="open-scanner" title="Skenovať čiarový kód">
+                    <ha-icon icon="mdi:barcode-scan"></ha-icon>
+                   </button>`
+                : ""
+            }
           </div>
           ${
             !shoppingMode && this._config.show_search && this._searchOpen
@@ -800,6 +1150,8 @@ class ShoppingCard extends HTMLElement {
 
         <div class="items">${groupsHtml}</div>
 
+        ${this._renderOffList()}
+
         ${
           !shoppingMode && completedCount > 0
             ? `<div class="footer">
@@ -811,10 +1163,13 @@ class ShoppingCard extends HTMLElement {
         }
 
               ${this._config.show_add ? this._renderAddForm(categories) : ""}
+              ${this._renderScannerOverlay()}
             </ha-card>`;
 
           // Put back what was being typed, and the caret, into the freshly built form.
           this._restoreFieldState(fieldState);
+          // Re-bind the live camera stream to the fresh <video> element, if open.
+          this._restoreScannerState();
         }
         _renderGroup(group) {
     const isCollapsed = group.category !== null && this._collapsed.has(group.category);
@@ -957,10 +1312,63 @@ class ShoppingCard extends HTMLElement {
     </form>`;
   }
 
+  _renderOffList() {
+    if (!this._offListPurchases.length) return "";
+    const subtotal = this._offListPurchases.reduce((s, p) => s + (p.price || 0) * (p.qty || 1), 0);
+    return `<div class="off-list">
+      <div class="off-list-header">
+        <ha-icon icon="mdi:barcode-off"></ha-icon>
+        <span>Mimo zoznamu</span>
+        ${subtotal > 0 ? `<span class="off-list-subtotal">${escapeHtml(formatPrice(subtotal, this._config.currency))}</span>` : ""}
+      </div>
+      ${this._offListPurchases
+        .map(
+          (p, idx) => `<div class="off-list-item">
+            <span class="off-list-name">${escapeHtml(p.name)}</span>
+            ${
+              p.price !== null && p.price !== undefined
+                ? `<span class="price">${escapeHtml(formatPrice(p.price, this._config.currency))}</span>`
+                : ""
+            }
+            <button class="icon-btn small" data-action="remove-offlist" data-idx="${idx}" title="Odstrániť">
+              <ha-icon icon="mdi:close"></ha-icon>
+            </button>
+          </div>`
+        )
+        .join("")}
+    </div>`;
+  }
+
+  _renderScannerOverlay() {
+    if (!this._scannerOpen) return "";
+    const statusKind = this._scanStatus?.kind || "idle";
+    const statusText = this._scanStatus?.text || "Namier kameru na čiarový kód…";
+    return `<div class="scan-overlay">
+      <div class="scan-topbar">
+        <span>Skenovanie</span>
+        <button class="icon-btn" data-action="close-scanner" title="Zavrieť">
+          <ha-icon icon="mdi:close"></ha-icon>
+        </button>
+      </div>
+      <video class="scan-video" autoplay muted playsinline></video>
+      <div class="scan-status scan-status-${statusKind}">${escapeHtml(statusText)}</div>
+      ${
+        this._scanPendingCode
+          ? `<form class="scan-manual-form" data-form="scan-manual">
+              <input type="text" name="name" class="scan-manual-name" placeholder="Názov" required autofocus />
+              <input type="number" name="price" class="scan-manual-price" step="0.01" min="0" placeholder="Cena" />
+              <input type="text" name="category" class="scan-manual-category" placeholder="Kategória" list="sc-categories" />
+              <button type="submit" class="icon-btn primary" title="Uložiť"><ha-icon icon="mdi:check"></ha-icon></button>
+             </form>`
+          : ""
+      }
+    </div>`;
+  }
+
   _styles() {
     return `<style>
       :host { display: block; }
-      ha-card { padding: 0; overflow: hidden; }
+      ha-card { padding: 0; overflow: hidden; position: relative; }
       .header { padding: 16px 16px 8px; }
       .title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
       .title { font-size: 1.2em; font-weight: 500; color: var(--primary-text-color); }
@@ -1082,6 +1490,50 @@ class ShoppingCard extends HTMLElement {
       .shopping-mode .item { padding: 12px 8px; font-size: 1.05em; }
       .shopping-mode .checkbox { width: 26px; height: 26px; }
       .shopping-mode .add-row .icon-btn.primary { width: 44px; height: 44px; }
+
+      /* Superscan mode: off-list purchases and the scanner overlay. */
+      .off-list { padding: 4px 16px 12px; border-top: 1px solid var(--divider-color); margin-top: 4px; }
+      .off-list-header {
+        display: flex; align-items: center; gap: 6px; padding: 8px 0;
+        color: var(--secondary-text-color); font-weight: 600; font-size: 0.85em;
+        text-transform: uppercase; letter-spacing: 0.03em;
+      }
+      .off-list-subtotal { margin-left: auto; color: var(--primary-text-color); text-transform: none; }
+      .off-list-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+      .off-list-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+      .scan-overlay {
+        position: absolute; inset: 0; z-index: 10;
+        background: var(--card-background-color);
+        display: flex; flex-direction: column;
+      }
+      .scan-topbar {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 8px 8px 8px 16px; font-weight: 500; color: var(--primary-text-color);
+      }
+      .scan-video { flex: 1; width: 100%; min-height: 200px; background: #000; object-fit: cover; }
+      .scan-status {
+        padding: 10px 16px; text-align: center; font-size: 0.95em;
+        color: var(--primary-text-color); min-height: 1.4em;
+      }
+      .scan-status-matched { color: var(--success-color, #43a047); }
+      .scan-status-offlist { color: var(--primary-color); }
+      .scan-status-error { color: var(--error-color, #db4437); }
+      .scan-manual-form {
+        display: flex; gap: 6px; flex-wrap: wrap; padding: 0 16px 16px;
+      }
+      .scan-manual-name { flex: 2; min-width: 100px; }
+      .scan-manual-price { width: 90px; }
+      .scan-manual-category { flex: 1; min-width: 80px; }
+      .scan-manual-name, .scan-manual-price, .scan-manual-category {
+        background: var(--card-background-color);
+        color: var(--primary-text-color);
+        border: 1px solid var(--divider-color);
+        border-radius: 8px;
+        padding: 6px 10px;
+        font-size: 0.9em;
+        font-family: inherit;
+      }
     </style>`;
   }
 
@@ -1148,6 +1600,15 @@ class ShoppingCard extends HTMLElement {
             history.pushState(null, "", this._config.nav_button_path);
             window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: false } }));
           }
+          break;
+        case "open-scanner":
+          this._openScanner();
+          break;
+        case "close-scanner":
+          this._closeScanner();
+          break;
+        case "remove-offlist":
+          this._removeOffListPurchase(Number(target.dataset.idx));
           break;
         default:
           break;
@@ -1226,6 +1687,18 @@ class ShoppingCard extends HTMLElement {
         const qty = (data.get("qty") || "").toString().trim();
         this._editingUid = null;
         this._renameItem(uid, name, category, price === "" ? null : price, description, qty === "" ? 1 : qty);
+      } else if (form.dataset.form === "scan-manual") {
+        const data = new FormData(form);
+        const name = (data.get("name") || "").toString().trim();
+        if (!name || !this._scanPendingCode) return;
+        const price = (data.get("price") || "").toString().trim();
+        const category = (data.get("category") || "").toString().trim();
+        this._applyScanResolution(
+          this._scanPendingCode,
+          name,
+          price === "" ? null : Number(price),
+          category || null
+        );
       }
     });
 
@@ -1233,6 +1706,8 @@ class ShoppingCard extends HTMLElement {
       if (ev.key === "Escape" && this._editingUid) {
         this._editingUid = null;
         this._render();
+      } else if (ev.key === "Escape" && this._scannerOpen) {
+        this._closeScanner();
       }
     });
 
@@ -1344,6 +1819,14 @@ class ShoppingCardEditor extends HTMLElement {
       { name: "nav_button_label", selector: { text: {} } },
       { name: "nav_button_icon", selector: { icon: {} } },
       { name: "nav_button_path", selector: { text: {} } },
+      {
+        name: "mode",
+        selector: {
+          select: { mode: "dropdown", options: MODE_OPTIONS },
+        },
+      },
+      { name: "mercadona_postal_code", selector: { text: {} } },
+      { name: "mercadona_warehouse", selector: { text: {} } },
     ];
   }
 
@@ -1365,6 +1848,9 @@ class ShoppingCardEditor extends HTMLElement {
       nav_button_label: "Extra button: label (optional)",
       nav_button_icon: "Extra button: icon",
       nav_button_path: "Extra button: navigates to (dashboard path, optional)",
+      mode: "Mode: normal or superscan (barcode, beta)",
+      mercadona_postal_code: "Superscan: postal code (for Mercadona price zone, best-effort)",
+      mercadona_warehouse: "Superscan: Mercadona warehouse code override (advanced, see README)",
     };
   }
 
@@ -1396,7 +1882,7 @@ window.customCards.push({
   type: CARD_TAG,
   name: "Shopping List Card",
   description:
-    "Editable shopping list card backed by a Home Assistant todo entity, with categories, prices, quantities, notes, drag-to-reorder, category/price suggestions and a shopping mode.",
+    "Editable shopping list card backed by a Home Assistant todo entity, with categories, prices, quantities, notes, drag-to-reorder, category/price suggestions, a shopping mode, and (v2, beta) a barcode-scanning superscan mode.",
   preview: true,
   documentationURL: "https://github.com/jan-tdy/ha-shopping-card",
 });

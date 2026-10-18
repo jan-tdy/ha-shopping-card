@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.0.0-beta0
+
+### Added
+- **Superscan mode** (`mode: superscan`): scan an item's barcode with the camera instead of
+  checking it off by hand. Matches against the current list when possible, otherwise logs a
+  one-time "off-list" purchase for the session.
+- Barcode/name/price memory, learned locally the same way category and price suggestions
+  already are, so a product only ever needs resolving once.
+- Best-effort live price/name lookup from Mercadona (Spain) via their unofficial search API,
+  configurable via `mercadona_postal_code` / `mercadona_warehouse`; always falls back to a
+  manual entry form when the lookup fails or isn't configured.
+- "Off-list" purchases list with a per-item remove action; their total is folded into the
+  existing cart ("already bought") total alongside checked-off items.
+
 ## v0.4.2
 
 ### Fixed
