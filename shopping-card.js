@@ -1059,22 +1059,6 @@ class ShoppingCard extends HTMLElement {
         <div class="header">
           <div class="title-row">
             <span class="title">${escapeHtml(this._config.title)}</span>
-            ${
-              this._config.show_prices && (estimatedTotal > 0 || cartTotal > 0)
-                ? `<div class="totals">
-                    ${
-                      estimatedTotal > 0
-                        ? `<span class="total-chip estimate" title="Estimated total (all items)">${escapeHtml(formatPrice(estimatedTotal, this._config.currency))}</span>`
-                        : ""
-                    }
-                    ${
-                      cartTotal > 0
-                        ? `<span class="total-chip cart" title="Cart total (checked off)"><ha-icon icon="mdi:cart-outline"></ha-icon>${escapeHtml(formatPrice(cartTotal, this._config.currency))}</span>`
-                        : ""
-                    }
-                   </div>`
-                : ""
-            }
           </div>
           <div class="toolbar">
             ${
@@ -1147,6 +1131,8 @@ class ShoppingCard extends HTMLElement {
               : ""
           }
         </div>
+
+        ${this._renderPriceTrackBar(estimatedTotal, cartTotal)}
 
         <div class="items">${groupsHtml}</div>
 
@@ -1312,6 +1298,24 @@ class ShoppingCard extends HTMLElement {
     </form>`;
   }
 
+  // A large, always-visible price summary (to-buy vs. already-bought), shown
+  // right under the header - deliberately big and hard to miss, the same way
+  // a running cart total is front-and-center in grocery-shopping apps.
+  _renderPriceTrackBar(estimatedTotal, cartTotal) {
+    if (!this._config.show_prices) return "";
+    return `<div class="price-track-bar">
+      <div class="price-track-stat buy">
+        <span class="price-track-label">To buy</span>
+        <span class="price-track-value">${escapeHtml(formatPrice(estimatedTotal, this._config.currency))}</span>
+      </div>
+      <div class="price-track-stat bought">
+        <ha-icon icon="mdi:cart-outline"></ha-icon>
+        <span class="price-track-label">Bought</span>
+        <span class="price-track-value">${escapeHtml(formatPrice(cartTotal, this._config.currency))}</span>
+      </div>
+    </div>`;
+  }
+
   _renderOffList() {
     if (!this._offListPurchases.length) return "";
     const subtotal = this._offListPurchases.reduce((s, p) => s + (p.price || 0) * (p.qty || 1), 0);
@@ -1372,17 +1376,22 @@ class ShoppingCard extends HTMLElement {
       .header { padding: 16px 16px 8px; }
       .title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
       .title { font-size: 1.2em; font-weight: 500; color: var(--primary-text-color); }
-      .totals { display: flex; align-items: center; gap: 6px; }
-      .total-chip {
-        display: inline-flex; align-items: center; gap: 4px;
-        font-size: 0.85em; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+      .price-track-bar {
+        display: flex; margin: 4px 16px 0; border-radius: 12px; overflow: hidden;
+        background: var(--primary-color);
       }
-      .total-chip ha-icon { --mdc-icon-size: 15px; }
-      .total-chip.estimate { color: var(--secondary-text-color); }
-      .total-chip.cart {
-        color: var(--primary-color);
-        background: rgba(var(--rgb-primary-color, 3,169,244), 0.12);
+      .price-track-stat {
+        flex: 1; display: flex; flex-direction: column; align-items: center;
+        gap: 2px; padding: 14px 8px;
+        color: var(--text-primary-color, #fff);
       }
+      .price-track-stat.bought { background: rgba(0, 0, 0, 0.14); }
+      .price-track-stat ha-icon { --mdc-icon-size: 18px; opacity: 0.9; }
+      .price-track-label {
+        font-size: 0.72em; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 0.06em; opacity: 0.85;
+      }
+      .price-track-value { font-size: 1.9em; font-weight: 800; line-height: 1.15; }
       .toolbar { display: flex; align-items: center; gap: 4px; margin-top: 8px; }
       .sort-select {
         flex: 1;
