@@ -4,6 +4,9 @@ An editable Home Assistant Lovelace shopping list card, backed by a `todo` entit
 (e.g. the built-in `todo.shopping_list`). Check items off, add/edit/delete them, organize
 by category, track prices, and see your progress — all from the card.
 
+<img width="545" height="624" alt="image" src="https://github.com/user-attachments/assets/080d4167-ac71-43da-845d-ba5083ed9451" />
+
+
 ## Features
 
 - **Check off / add / rename / delete** items inline, no dialogs.
