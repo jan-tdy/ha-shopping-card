@@ -6,7 +6,7 @@
  * https://github.com/jan-tdy/ha-shopping-card
  */
 
-const CARD_VERSION = "0.4.2";
+const CARD_VERSION = "0.5.0";
 const CARD_TAG = "shopping-card";
 const EDITOR_TAG = "shopping-card-editor";
 
@@ -186,6 +186,9 @@ class ShoppingCard extends HTMLElement {
     this._addCategoryTouched = false;
     this._shoppingMode = false;
     this._listenersBound = false;
+    this._toast = null;
+    this._pendingUndo = null;
+    this._frequency = {};
   }
 
   setConfig(config) {
@@ -213,6 +216,7 @@ class ShoppingCard extends HTMLElement {
     this._loadPrefs();
     this._loadLearned();
     this._loadPriceHistory();
+    this._loadFrequency();
     this._render();
     if (this._hass) this._fetchItems();
   }
@@ -376,6 +380,50 @@ class ShoppingCard extends HTMLElement {
     return this._priceHistory[key] ?? null;
   }
 
+  // ---------- frequent items (per-entity, local) ----------
+
+  _loadFrequency() {
+    this._frequency = {};
+    try {
+      const raw = localStorage.getItem(`shopping-card-freq-${this._config.entity}`);
+      if (raw) this._frequency = JSON.parse(raw);
+    } catch (e) {
+      // ignore malformed/unavailable storage
+    }
+  }
+
+  _saveFrequency() {
+    try {
+      localStorage.setItem(`shopping-card-freq-${this._config.entity}`, JSON.stringify(this._frequency));
+    } catch (e) {
+      // ignore malformed/unavailable storage
+    }
+  }
+
+  _bumpFrequency(name) {
+    const label = (name || "").trim();
+    const key = label.toLowerCase();
+    if (!key) return;
+    const existing = this._frequency[key];
+    this._frequency[key] = { count: (existing?.count || 0) + 1, label };
+    this._saveFrequency();
+  }
+
+  // Most-added items that aren't already on the active (non-completed) list,
+  // most-frequent first, for one-tap re-adding.
+  _frequentSuggestions(limit = 6) {
+    const activeNames = new Set(
+      this._items
+        .filter((it) => it.status !== "completed")
+        .map((it) => parseItemText(it.summary).name.trim().toLowerCase())
+    );
+    return Object.entries(this._frequency || {})
+      .filter(([key]) => !activeNames.has(key))
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, limit)
+      .map(([key, value]) => ({ key, label: value.label || key }));
+  }
+
   // ---------- capabilities ----------
 
   _supportsFeature(bit) {
@@ -427,6 +475,7 @@ class ShoppingCard extends HTMLElement {
     }
     this._learnCategory(name, category);
     this._learnPrice(name, price);
+    this._bumpFrequency(name);
     try {
       await this._callService("add_item", data);
     } catch (e) {
@@ -503,6 +552,69 @@ class ShoppingCard extends HTMLElement {
         }
       }
     }
+  }
+
+  // ---------- undo ----------
+
+  // Shows a dismissible toast with an "Undo" action. `restoreFn` is called if the
+  // user taps undo before the toast times out; it's responsible for re-rendering.
+  _showUndo(message, restoreFn) {
+    clearTimeout(this._toastTimer);
+    this._toast = { message };
+    this._pendingUndo = restoreFn;
+    this._toastTimer = setTimeout(() => {
+      this._toast = null;
+      this._pendingUndo = null;
+      this._render();
+    }, 6000);
+    this._render();
+  }
+
+  _dismissUndo() {
+    clearTimeout(this._toastTimer);
+    this._toast = null;
+    this._pendingUndo = null;
+  }
+
+  // Re-adds previously deleted items (new uids; manual order isn't preserved,
+  // same limitation as any other re-add through the todo API).
+  async _restoreItems(snapshots) {
+    for (const snap of snapshots) {
+      const data = { item: snap.summary };
+      if (snap.description && this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
+        data.description = snap.description;
+      }
+      try {
+        await this._callService("add_item", data);
+      } catch (e) {
+        console.error("shopping-card: undo add_item failed", e);
+        continue;
+      }
+      if (snap.status === "completed") {
+        await this._fetchItems();
+        const added = this._items.find((it) => it.summary === snap.summary && it.status !== "completed");
+        if (added) await this._setStatus(added.uid, true);
+      }
+    }
+    await this._fetchItems();
+  }
+
+  async _deleteItemWithUndo(uid) {
+    const item = this._items.find((it) => it.uid === uid);
+    if (!item) return;
+    const snapshot = { summary: item.summary, status: item.status, description: item.description };
+    await this._removeItem(uid);
+    this._showUndo("Item deleted", () => this._restoreItems([snapshot]));
+  }
+
+  async _clearCompletedWithUndo() {
+    const snapshots = this._items
+      .filter((it) => it.status === "completed")
+      .map((it) => ({ summary: it.summary, status: it.status, description: it.description }));
+    if (!snapshots.length) return;
+    await this._clearCompleted();
+    const label = snapshots.length === 1 ? "1 item cleared" : `${snapshots.length} items cleared`;
+    this._showUndo(label, () => this._restoreItems(snapshots));
   }
 
   // ---------- derived data ----------
@@ -801,6 +913,18 @@ class ShoppingCard extends HTMLElement {
         <div class="items">${groupsHtml}</div>
 
         ${
+          this._toast
+            ? `<div class="toast">
+                <span class="toast-message">${escapeHtml(this._toast.message)}</span>
+                <button class="text-btn toast-undo" data-action="undo">Undo</button>
+                <button class="icon-btn small" data-action="dismiss-toast" title="Dismiss">
+                  <ha-icon icon="mdi:close"></ha-icon>
+                </button>
+               </div>`
+            : ""
+        }
+
+        ${
           !shoppingMode && completedCount > 0
             ? `<div class="footer">
                 <button class="text-btn" data-action="clear-completed">
@@ -919,10 +1043,26 @@ class ShoppingCard extends HTMLElement {
     </div>`;
   }
 
+  _renderQuickAddChips() {
+    if (this._shoppingMode) return "";
+    const suggestions = this._frequentSuggestions();
+    if (!suggestions.length) return "";
+    return `<div class="quick-add-chips">
+      ${suggestions
+        .map(
+          (s) => `<button type="button" class="quick-chip" data-action="quick-add" data-name="${escapeHtml(s.label)}" title="Add ${escapeHtml(s.label)}">
+            <ha-icon icon="mdi:plus"></ha-icon>${escapeHtml(s.label)}
+          </button>`
+        )
+        .join("")}
+    </div>`;
+  }
+
   _renderAddForm(categories) {
     const descriptionSupported = this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION);
     const shoppingMode = this._shoppingMode;
     return `<form class="add-form" data-form="add">
+      ${this._renderQuickAddChips()}
       <div class="add-row">
         <input type="text" name="name" class="add-name" placeholder="Add item…" autocomplete="off" required />
         ${shoppingMode ? "" : `<span class="suggest-hint"></span>`}
@@ -1056,6 +1196,27 @@ class ShoppingCard extends HTMLElement {
       .edit-category { flex: 1; min-width: 80px; }
       .edit-price { width: 80px; }
       .edit-description { width: 100%; box-sizing: border-box; resize: vertical; }
+      .toast {
+        display: flex; align-items: center; gap: 8px;
+        margin: 4px 16px; padding: 8px 10px 8px 14px; border-radius: 10px;
+        background: var(--primary-text-color); color: var(--primary-background-color, #fff);
+      }
+      .toast-message { flex: 1; font-size: 0.85em; }
+      .toast-undo { color: var(--primary-color); font-weight: 600; }
+      .toast .icon-btn { color: inherit; opacity: 0.8; width: 28px; height: 28px; }
+      .quick-add-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+      .quick-chip {
+        display: inline-flex; align-items: center; gap: 2px;
+        background: var(--card-background-color);
+        color: var(--secondary-text-color);
+        border: 1px solid var(--divider-color);
+        border-radius: 14px;
+        padding: 4px 10px 4px 6px;
+        font-size: 0.8em;
+        cursor: pointer;
+      }
+      .quick-chip:hover { color: var(--primary-color); border-color: var(--primary-color); }
+      .quick-chip ha-icon { --mdc-icon-size: 16px; }
       .footer { padding: 4px 8px 8px; display: flex; justify-content: flex-end; }
       .text-btn {
         display: inline-flex; align-items: center; gap: 4px;
@@ -1125,10 +1286,30 @@ class ShoppingCard extends HTMLElement {
           this._render();
           break;
         case "delete-item":
-          if (confirm("Delete this item?")) this._removeItem(uid);
+          this._deleteItemWithUndo(uid);
           break;
         case "clear-completed":
-          if (confirm("Remove all completed items?")) this._clearCompleted();
+          this._clearCompletedWithUndo();
+          break;
+        case "undo":
+          {
+            const restoreFn = this._pendingUndo;
+            this._dismissUndo();
+            this._render();
+            if (restoreFn) restoreFn();
+          }
+          break;
+        case "dismiss-toast":
+          this._dismissUndo();
+          this._render();
+          break;
+        case "quick-add":
+          {
+            const name = target.dataset.name;
+            if (name) {
+              this._addItem(name, this._suggestCategory(name), this._suggestPrice(name), "", 1);
+            }
+          }
           break;
         case "toggle-add-extra":
           this._addExtraOpen = !this._addExtraOpen;
