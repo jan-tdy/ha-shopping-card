@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.0
+
+### Added
+- Undo for deleting an item or clearing completed items: both now show a dismissible
+  toast with an "Undo" button (6s) instead of a confirmation dialog. (#7)
+- Frequent-item quick-add chips: items you add often show up as one-tap chips above
+  the add form (hidden once already on the active list, and in shopping mode). (#7)
+
 ## v0.4.2
 
 ### Fixed
