@@ -189,6 +189,8 @@ class ShoppingCard extends HTMLElement {
     this._toast = null;
     this._pendingUndo = null;
     this._frequency = {};
+    this._fetchRequestId = 0;
+    this._loadError = null;
   }
 
   setConfig(config) {
@@ -445,18 +447,32 @@ class ShoppingCard extends HTMLElement {
 
   async _fetchItems() {
     if (!this._hass || !this._config) return;
+    const requestId = ++this._fetchRequestId;
     try {
       const result = await this._hass.callWS({
         type: "todo/item/list",
         entity_id: this._config.entity,
       });
+      if (requestId !== this._fetchRequestId) return;
       this._items = result?.items ?? [];
+      this._loadError = null;
     } catch (e) {
+      if (requestId !== this._fetchRequestId) return;
       console.error("shopping-card: failed to load items", e);
-      this._items = [];
+      this._loadError = "Could not refresh items. Your last loaded list is still shown.";
     }
     this._loaded = true;
     this._render();
+  }
+
+  _actionFailed(action, error) {
+    console.error(`shopping-card: ${action} failed`, error);
+    this.dispatchEvent(new CustomEvent("hass-notification", {
+      detail: { message: `Could not ${action}. The list is being refreshed.` },
+      bubbles: true,
+      composed: true,
+    }));
+    void this._fetchItems();
   }
 
   _callService(service, data) {
@@ -473,13 +489,15 @@ class ShoppingCard extends HTMLElement {
     if (description && this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
       data.description = description;
     }
-    this._learnCategory(name, category);
-    this._learnPrice(name, price);
-    this._bumpFrequency(name);
     try {
       await this._callService("add_item", data);
+      this._learnCategory(name, category);
+      this._learnPrice(name, price);
+      this._bumpFrequency(name);
+      return true;
     } catch (e) {
-      console.error("shopping-card: add_item failed", e);
+      this._actionFailed("add item", e);
+      return false;
     }
   }
 
@@ -490,12 +508,14 @@ class ShoppingCard extends HTMLElement {
     if (this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
       data.description = description || "";
     }
-    this._learnCategory(name, category);
-    this._learnPrice(name, price);
     try {
       await this._callService("update_item", data);
+      this._learnCategory(name, category);
+      this._learnPrice(name, price);
+      return true;
     } catch (e) {
-      console.error("shopping-card: update_item failed", e);
+      this._actionFailed("save item", e);
+      return false;
     }
   }
 
@@ -515,9 +535,10 @@ class ShoppingCard extends HTMLElement {
         previous_uid: previousUid ?? undefined,
       });
     } catch (e) {
-      console.error("shopping-card: move failed", e);
+      this._actionFailed("move item", e);
+      return;
     }
-    this._fetchItems();
+    void this._fetchItems();
   }
 
   async _setStatus(uid, completed) {
@@ -527,7 +548,7 @@ class ShoppingCard extends HTMLElement {
         status: completed ? "completed" : "needs_action",
       });
     } catch (e) {
-      console.error("shopping-card: update_item (status) failed", e);
+      this._actionFailed("update item status", e);
     }
   }
 
@@ -535,7 +556,7 @@ class ShoppingCard extends HTMLElement {
     try {
       await this._callService("remove_item", { item: uid });
     } catch (e) {
-      console.error("shopping-card: remove_item failed", e);
+      this._actionFailed("remove item", e);
     }
   }
 
@@ -548,7 +569,7 @@ class ShoppingCard extends HTMLElement {
         try {
           await this._callService("remove_item", { item: uids });
         } catch (e2) {
-          console.error("shopping-card: fallback clear completed failed", e2);
+          this._actionFailed("clear completed items", e2);
         }
       }
     }
@@ -817,6 +838,8 @@ class ShoppingCard extends HTMLElement {
 
     const groupsHtml = !this._loaded
       ? `<div class="empty-state">Loading…</div>`
+      : total === 0 && this._loadError
+      ? `<div class="empty-state">Could not load items. Retry or check your connection.</div>`
       : total === 0
       ? `<div class="empty-state">No items yet. Add one below.</div>`
       : processed.length === 0
@@ -910,6 +933,7 @@ class ShoppingCard extends HTMLElement {
           }
         </div>
 
+        ${this._loadError ? `<div class="error-banner">${escapeHtml(this._loadError)} <button class="text-btn" data-action="retry-fetch">Retry</button></div>` : ""}
         <div class="items">${groupsHtml}</div>
 
         ${
@@ -1302,6 +1326,9 @@ class ShoppingCard extends HTMLElement {
         case "dismiss-toast":
           this._dismissUndo();
           this._render();
+          break;
+        case "retry-fetch":
+          void this._fetchItems();
           break;
         case "quick-add":
           {
