@@ -1409,6 +1409,12 @@ class ShoppingCard extends HTMLElement {
 
       if (form.dataset.form === "add") {
         const data = new FormData(form);
+        const submittedValues = Object.fromEntries(
+          ["name", "category", "price", "description", "qty"].map((key) => [
+            key,
+            (data.get(key) || "").toString(),
+          ])
+        );
         const name = (data.get("name") || "").toString().trim();
         if (!name) return;
         const category = (data.get("category") || "").toString().trim();
@@ -1418,6 +1424,11 @@ class ShoppingCard extends HTMLElement {
         void this._addItem(name, category, price === "" ? null : price, description, qty === "" ? 1 : qty)
           .then((ok) => {
             if (!ok) return;
+            const currentValues = new FormData(form);
+            const unchanged = Object.entries(submittedValues).every(
+              ([key, value]) => (currentValues.get(key) || "").toString() === value
+            );
+            if (!unchanged) return;
             form.reset();
             const extra = form.querySelector(".add-extra");
             if (extra) extra.hidden = true;
