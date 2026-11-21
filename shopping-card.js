@@ -1176,6 +1176,7 @@ class ShoppingCard extends HTMLElement {
       .progress-label { font-size: 0.8em; color: var(--secondary-text-color); min-width: 40px; text-align: right; }
       .items { padding: 4px 8px; }
       .empty-state { padding: 24px 16px; text-align: center; color: var(--secondary-text-color); }
+      .error-banner { padding: 8px 12px; color: var(--error-color, #b3261e); text-align: center; }
       .group { margin-bottom: 4px; }
       .group-header {
         display: flex; align-items: center; gap: 6px;
@@ -1414,16 +1415,19 @@ class ShoppingCard extends HTMLElement {
         const price = (data.get("price") || "").toString().trim();
         const description = (data.get("description") || "").toString().trim();
         const qty = (data.get("qty") || "").toString().trim();
-        this._addItem(name, category, price === "" ? null : price, description, qty === "" ? 1 : qty);
-        form.reset();
-        const extra = form.querySelector(".add-extra");
-        if (extra) extra.hidden = true;
-        this._addExtraOpen = false;
-        this._addCategoryTouched = false;
-        const hint = form.querySelector(".suggest-hint");
-        if (hint) hint.textContent = "";
-        const priceInput = form.querySelector(".add-price");
-        if (priceInput) priceInput.placeholder = "Price";
+        void this._addItem(name, category, price === "" ? null : price, description, qty === "" ? 1 : qty)
+          .then((ok) => {
+            if (!ok) return;
+            form.reset();
+            const extra = form.querySelector(".add-extra");
+            if (extra) extra.hidden = true;
+            this._addExtraOpen = false;
+            this._addCategoryTouched = false;
+            const hint = form.querySelector(".suggest-hint");
+            if (hint) hint.textContent = "";
+            const priceInput = form.querySelector(".add-price");
+            if (priceInput) priceInput.placeholder = "Price";
+          });
       } else if (form.dataset.form === "edit") {
         const uid = form.dataset.uid;
         const data = new FormData(form);
@@ -1432,8 +1436,12 @@ class ShoppingCard extends HTMLElement {
         const price = (data.get("price") || "").toString().trim();
         const description = (data.get("description") || "").toString().trim();
         const qty = (data.get("qty") || "").toString().trim();
-        this._editingUid = null;
-        this._renameItem(uid, name, category, price === "" ? null : price, description, qty === "" ? 1 : qty);
+        void this._renameItem(uid, name, category, price === "" ? null : price, description, qty === "" ? 1 : qty)
+          .then((ok) => {
+            if (!ok) return;
+            this._editingUid = null;
+            this._render();
+          });
       }
     });
 
