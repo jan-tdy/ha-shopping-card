@@ -1449,7 +1449,7 @@ class ShoppingCard extends HTMLElement {
         const qty = (data.get("qty") || "").toString().trim();
         void this._renameItem(uid, name, category, price === "" ? null : price, description, qty === "" ? 1 : qty)
           .then((ok) => {
-            if (!ok) return;
+            if (!ok || !form.isConnected || this._editingUid !== uid) return;
             this._editingUid = null;
             this._render();
           });
