@@ -1442,6 +1442,12 @@ class ShoppingCard extends HTMLElement {
       } else if (form.dataset.form === "edit") {
         const uid = form.dataset.uid;
         const data = new FormData(form);
+        const submittedValues = Object.fromEntries(
+          ["name", "category", "price", "description", "qty"].map((key) => [
+            key,
+            (data.get(key) || "").toString(),
+          ])
+        );
         const name = (data.get("name") || "").toString().trim();
         const category = (data.get("category") || "").toString().trim();
         const price = (data.get("price") || "").toString().trim();
@@ -1450,6 +1456,11 @@ class ShoppingCard extends HTMLElement {
         void this._renameItem(uid, name, category, price === "" ? null : price, description, qty === "" ? 1 : qty)
           .then((ok) => {
             if (!ok || !form.isConnected || this._editingUid !== uid) return;
+            const currentValues = new FormData(form);
+            const unchanged = Object.entries(submittedValues).every(
+              ([key, value]) => (currentValues.get(key) || "").toString() === value
+            );
+            if (!unchanged) return;
             this._editingUid = null;
             this._render();
           });
