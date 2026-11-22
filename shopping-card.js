@@ -189,6 +189,8 @@ class ShoppingCard extends HTMLElement {
     this._toast = null;
     this._pendingUndo = null;
     this._frequency = {};
+    this._fetchRequestId = 0;
+    this._loadError = null;
   }
 
   setConfig(config) {
@@ -445,18 +447,32 @@ class ShoppingCard extends HTMLElement {
 
   async _fetchItems() {
     if (!this._hass || !this._config) return;
+    const requestId = ++this._fetchRequestId;
     try {
       const result = await this._hass.callWS({
         type: "todo/item/list",
         entity_id: this._config.entity,
       });
+      if (requestId !== this._fetchRequestId) return;
       this._items = result?.items ?? [];
+      this._loadError = null;
     } catch (e) {
+      if (requestId !== this._fetchRequestId) return;
       console.error("shopping-card: failed to load items", e);
-      this._items = [];
+      this._loadError = "Could not refresh items. Your last loaded list is still shown.";
     }
     this._loaded = true;
     this._render();
+  }
+
+  _actionFailed(action, error) {
+    console.error(`shopping-card: ${action} failed`, error);
+    this.dispatchEvent(new CustomEvent("hass-notification", {
+      detail: { message: `Could not ${action}. The list is being refreshed.` },
+      bubbles: true,
+      composed: true,
+    }));
+    void this._fetchItems();
   }
 
   _callService(service, data) {
@@ -473,13 +489,15 @@ class ShoppingCard extends HTMLElement {
     if (description && this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
       data.description = description;
     }
-    this._learnCategory(name, category);
-    this._learnPrice(name, price);
-    this._bumpFrequency(name);
     try {
       await this._callService("add_item", data);
+      this._learnCategory(name, category);
+      this._learnPrice(name, price);
+      this._bumpFrequency(name);
+      return true;
     } catch (e) {
-      console.error("shopping-card: add_item failed", e);
+      this._actionFailed("add item", e);
+      return false;
     }
   }
 
@@ -490,12 +508,14 @@ class ShoppingCard extends HTMLElement {
     if (this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
       data.description = description || "";
     }
-    this._learnCategory(name, category);
-    this._learnPrice(name, price);
     try {
       await this._callService("update_item", data);
+      this._learnCategory(name, category);
+      this._learnPrice(name, price);
+      return true;
     } catch (e) {
-      console.error("shopping-card: update_item failed", e);
+      this._actionFailed("save item", e);
+      return false;
     }
   }
 
@@ -515,9 +535,10 @@ class ShoppingCard extends HTMLElement {
         previous_uid: previousUid ?? undefined,
       });
     } catch (e) {
-      console.error("shopping-card: move failed", e);
+      this._actionFailed("move item", e);
+      return;
     }
-    this._fetchItems();
+    void this._fetchItems();
   }
 
   async _setStatus(uid, completed) {
@@ -527,7 +548,7 @@ class ShoppingCard extends HTMLElement {
         status: completed ? "completed" : "needs_action",
       });
     } catch (e) {
-      console.error("shopping-card: update_item (status) failed", e);
+      this._actionFailed("update item status", e);
     }
   }
 
@@ -535,7 +556,7 @@ class ShoppingCard extends HTMLElement {
     try {
       await this._callService("remove_item", { item: uid });
     } catch (e) {
-      console.error("shopping-card: remove_item failed", e);
+      this._actionFailed("remove item", e);
     }
   }
 
@@ -548,7 +569,7 @@ class ShoppingCard extends HTMLElement {
         try {
           await this._callService("remove_item", { item: uids });
         } catch (e2) {
-          console.error("shopping-card: fallback clear completed failed", e2);
+          this._actionFailed("clear completed items", e2);
         }
       }
     }
@@ -817,6 +838,8 @@ class ShoppingCard extends HTMLElement {
 
     const groupsHtml = !this._loaded
       ? `<div class="empty-state">Loading…</div>`
+      : total === 0 && this._loadError
+      ? `<div class="empty-state">Could not load items. Retry or check your connection.</div>`
       : total === 0
       ? `<div class="empty-state">No items yet. Add one below.</div>`
       : processed.length === 0
@@ -910,6 +933,7 @@ class ShoppingCard extends HTMLElement {
           }
         </div>
 
+        ${this._loadError ? `<div class="error-banner">${escapeHtml(this._loadError)} <button class="text-btn" data-action="retry-fetch">Retry</button></div>` : ""}
         <div class="items">${groupsHtml}</div>
 
         ${
@@ -1152,6 +1176,7 @@ class ShoppingCard extends HTMLElement {
       .progress-label { font-size: 0.8em; color: var(--secondary-text-color); min-width: 40px; text-align: right; }
       .items { padding: 4px 8px; }
       .empty-state { padding: 24px 16px; text-align: center; color: var(--secondary-text-color); }
+      .error-banner { padding: 8px 12px; color: var(--error-color, #b3261e); text-align: center; }
       .group { margin-bottom: 4px; }
       .group-header {
         display: flex; align-items: center; gap: 6px;
@@ -1303,6 +1328,9 @@ class ShoppingCard extends HTMLElement {
           this._dismissUndo();
           this._render();
           break;
+        case "retry-fetch":
+          void this._fetchItems();
+          break;
         case "quick-add":
           {
             const name = target.dataset.name;
@@ -1381,32 +1409,61 @@ class ShoppingCard extends HTMLElement {
 
       if (form.dataset.form === "add") {
         const data = new FormData(form);
+        const submittedValues = Object.fromEntries(
+          ["name", "category", "price", "description", "qty"].map((key) => [
+            key,
+            (data.get(key) || "").toString(),
+          ])
+        );
         const name = (data.get("name") || "").toString().trim();
         if (!name) return;
         const category = (data.get("category") || "").toString().trim();
         const price = (data.get("price") || "").toString().trim();
         const description = (data.get("description") || "").toString().trim();
         const qty = (data.get("qty") || "").toString().trim();
-        this._addItem(name, category, price === "" ? null : price, description, qty === "" ? 1 : qty);
-        form.reset();
-        const extra = form.querySelector(".add-extra");
-        if (extra) extra.hidden = true;
-        this._addExtraOpen = false;
-        this._addCategoryTouched = false;
-        const hint = form.querySelector(".suggest-hint");
-        if (hint) hint.textContent = "";
-        const priceInput = form.querySelector(".add-price");
-        if (priceInput) priceInput.placeholder = "Price";
+        void this._addItem(name, category, price === "" ? null : price, description, qty === "" ? 1 : qty)
+          .then((ok) => {
+            if (!ok) return;
+            const currentValues = new FormData(form);
+            const unchanged = Object.entries(submittedValues).every(
+              ([key, value]) => (currentValues.get(key) || "").toString() === value
+            );
+            if (!unchanged) return;
+            form.reset();
+            const extra = form.querySelector(".add-extra");
+            if (extra) extra.hidden = true;
+            this._addExtraOpen = false;
+            this._addCategoryTouched = false;
+            const hint = form.querySelector(".suggest-hint");
+            if (hint) hint.textContent = "";
+            const priceInput = form.querySelector(".add-price");
+            if (priceInput) priceInput.placeholder = "Price";
+          });
       } else if (form.dataset.form === "edit") {
         const uid = form.dataset.uid;
         const data = new FormData(form);
+        const submittedValues = Object.fromEntries(
+          ["name", "category", "price", "description", "qty"].map((key) => [
+            key,
+            (data.get(key) || "").toString(),
+          ])
+        );
         const name = (data.get("name") || "").toString().trim();
         const category = (data.get("category") || "").toString().trim();
         const price = (data.get("price") || "").toString().trim();
         const description = (data.get("description") || "").toString().trim();
         const qty = (data.get("qty") || "").toString().trim();
-        this._editingUid = null;
-        this._renameItem(uid, name, category, price === "" ? null : price, description, qty === "" ? 1 : qty);
+        void this._renameItem(uid, name, category, price === "" ? null : price, description, qty === "" ? 1 : qty)
+          .then((ok) => {
+            if (!ok || !form.isConnected || this._editingUid !== uid) return;
+            const currentValues = new FormData(form);
+            const unchanged = Object.entries(submittedValues).every(
+              ([key, value]) => (currentValues.get(key) || "").toString() === value
+            );
+            if (!unchanged) return;
+            this._editingUid = null;
+            this._render();
+          });
       }
     });
 
