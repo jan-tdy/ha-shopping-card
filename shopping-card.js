@@ -555,22 +555,29 @@ class ShoppingCard extends HTMLElement {
   async _removeItem(uid) {
     try {
       await this._callService("remove_item", { item: uid });
+      return true;
     } catch (e) {
       this._actionFailed("remove item", e);
+      return false;
     }
   }
 
   async _clearCompleted() {
     try {
       await this._callService("remove_completed_items", {});
+      return true;
     } catch (e) {
       const uids = this._items.filter((i) => i.status === "completed").map((i) => i.uid);
-      if (uids.length) {
-        try {
-          await this._callService("remove_item", { item: uids });
-        } catch (e2) {
-          this._actionFailed("clear completed items", e2);
-        }
+      if (!uids.length) {
+        this._actionFailed("clear completed items", e);
+        return false;
+      }
+      try {
+        await this._callService("remove_item", { item: uids });
+        return true;
+      } catch (e2) {
+        this._actionFailed("clear completed items", e2);
+        return false;
       }
     }
   }
@@ -581,8 +588,12 @@ class ShoppingCard extends HTMLElement {
   // user taps undo before the toast times out; it's responsible for re-rendering.
   _showUndo(message, restoreFn) {
     clearTimeout(this._toastTimer);
-    this._toast = { message };
-    this._pendingUndo = restoreFn;
+    const actions = this._pendingUndo || [];
+    actions.push(restoreFn);
+    this._pendingUndo = actions;
+    this._toast = {
+      message: actions.length === 1 ? message : `${actions.length} changes made`,
+    };
     this._toastTimer = setTimeout(() => {
       this._toast = null;
       this._pendingUndo = null;
@@ -601,6 +612,7 @@ class ShoppingCard extends HTMLElement {
   // same limitation as any other re-add through the todo API).
   async _restoreItems(snapshots) {
     for (const snap of snapshots) {
+      const previousUids = new Set(this._items.map((item) => item.uid));
       const data = { item: snap.summary };
       if (snap.description && this._supportsFeature(TODO_FEATURES.SET_DESCRIPTION)) {
         data.description = snap.description;
@@ -613,7 +625,9 @@ class ShoppingCard extends HTMLElement {
       }
       if (snap.status === "completed") {
         await this._fetchItems();
-        const added = this._items.find((it) => it.summary === snap.summary && it.status !== "completed");
+        const added = this._items.find(
+          (item) => !previousUids.has(item.uid) && item.summary === snap.summary
+        );
         if (added) await this._setStatus(added.uid, true);
       }
     }
@@ -624,7 +638,7 @@ class ShoppingCard extends HTMLElement {
     const item = this._items.find((it) => it.uid === uid);
     if (!item) return;
     const snapshot = { summary: item.summary, status: item.status, description: item.description };
-    await this._removeItem(uid);
+    if (!await this._removeItem(uid)) return;
     this._showUndo("Item deleted", () => this._restoreItems([snapshot]));
   }
 
@@ -633,7 +647,7 @@ class ShoppingCard extends HTMLElement {
       .filter((it) => it.status === "completed")
       .map((it) => ({ summary: it.summary, status: it.status, description: it.description }));
     if (!snapshots.length) return;
-    await this._clearCompleted();
+    if (!await this._clearCompleted()) return;
     const label = snapshots.length === 1 ? "1 item cleared" : `${snapshots.length} items cleared`;
     this._showUndo(label, () => this._restoreItems(snapshots));
   }
@@ -1318,10 +1332,14 @@ class ShoppingCard extends HTMLElement {
           break;
         case "undo":
           {
-            const restoreFn = this._pendingUndo;
+            const restoreFns = this._pendingUndo;
             this._dismissUndo();
             this._render();
-            if (restoreFn) restoreFn();
+            if (restoreFns) {
+              void (async () => {
+                for (const restoreFn of restoreFns.reverse()) await restoreFn();
+              })();
+            }
           }
           break;
         case "dismiss-toast":
